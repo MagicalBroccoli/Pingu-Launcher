@@ -1,0 +1,16 @@
+FROM docker.io/library/debian:bullseye
+
+# Debian 11 has glibc 2.31, which sets the minimum for the finished binary and for the hook.
+# The release is archived, so its package sources move to archive.debian.org.
+RUN sed -i -e '/bullseye-updates/d' \
+      -e 's|deb.debian.org/debian-security|archive.debian.org/debian-security|' \
+      -e 's|deb.debian.org/debian|archive.debian.org/debian|' /etc/apt/sources.list \
+ && echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends build-essential pkg-config binutils \
+      libfontconfig1-dev libfreetype6-dev ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+ | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH

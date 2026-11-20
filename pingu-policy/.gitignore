@@ -1,0 +1,13 @@
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+compile_commands.json
+validation/
+validation.result.json
+vm-validation-*/
+profile.generated.h
+profile.generated.json

@@ -1,0 +1,57 @@
+#!/bin/sh
+# Loads the prebuilt pingu modules that match the running kernel build. Runs as root from pingu-modules.service.
+set -u
+
+base=/var/lib/pingu-runtime
+release=$(uname -r)
+status=0
+
+# The module accepts only the exact build it was made for, and the same release string
+# can be a different build (SteamOS channels rebuild it), so the GNU build ID decides.
+notes=$(od -An -tx1 -v /sys/kernel/notes 2>/dev/null | tr -d ' \n')
+build_id=${notes#*040000001400000003000000474e5500}
+if [ "$build_id" = "$notes" ]; then
+	echo "pingu: cannot read the kernel build ID from /sys/kernel/notes" >&2
+	exit 1
+fi
+build_id=$(printf %.40s "$build_id")
+modules=$base/modules/$build_id
+
+if [ ! -d "$modules" ]; then
+	echo "pingu: no prebuilt modules for kernel $release (build ID $build_id); install a newer module bundle" >&2
+	exit 1
+fi
+
+load() {
+	name=$1
+	shift
+	if [ -d "/sys/module/$name" ]; then
+		echo "pingu: $name is already loaded"
+		return 0
+	fi
+	if ! insmod "$modules/$name.ko" "$@"; then
+		echo "pingu: $name failed to load; see dmesg" >&2
+		status=1
+		return 1
+	fi
+	echo "pingu: loaded $name for $release ($build_id)"
+}
+
+# The restriction only matters on CPUs with AVX-512 (a Steam Deck has none).
+if grep -qw avx512f /proc/cpuinfo; then
+	if load pingu_policy; then
+		if [ "$(cat /sys/module/pingu_policy/parameters/ready)" != Y ]; then
+			echo "pingu: pingu_policy is inactive (ready=N); see dmesg and reboot after fixing the cause" >&2
+			status=1
+		fi
+	fi
+else
+	echo "pingu: no AVX-512 on this CPU, pingu_policy is not needed"
+fi
+
+# Runs the whole kernel as an SVM guest, so it is only loaded when the owner opted in.
+if [ -e "$base/enable-cpuid-fault" ]; then
+	load cpuid_fault_emulation
+fi
+
+exit $status

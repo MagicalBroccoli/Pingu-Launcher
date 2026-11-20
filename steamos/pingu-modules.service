@@ -1,0 +1,12 @@
+[Unit]
+Description=Load the pingu kernel modules built for this SteamOS kernel
+After=local-fs.target
+ConditionPathExists=/var/lib/pingu-runtime/pingu-modules-load
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/var/lib/pingu-runtime/pingu-modules-load
+
+[Install]
+WantedBy=multi-user.target

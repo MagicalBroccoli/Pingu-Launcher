@@ -1,0 +1,30 @@
+[package]
+name = "pingu-module-tool"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "pingu-module-tool"
+path = "src/main.rs"
+
+[dependencies]
+bzip2 = "0.6"
+capstone-sys = { version = "0.18.0", default-features = false, features = ["full", "arch_x86"] }
+flate2 = "1"
+libc = "0.2"
+liblzma = { version = "0.4", features = ["static"] }
+object = { version = "0.41.0", default-features = false, features = [
+    "read_core",
+    "elf",
+    "std",
+] }
+regex-lite = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.1"
+zstd = "0.14.4"
+
+[profile.release]
+strip = true
+opt-level = 2

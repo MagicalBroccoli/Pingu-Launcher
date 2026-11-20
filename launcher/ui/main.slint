@@ -1,0 +1,426 @@
+import { Button, ProgressIndicator, ScrollView } from "std-widgets.slint";
+
+export enum CheckLevel {
+    ok,
+    problem,
+}
+
+export struct CheckItem {
+    title: string,
+    level: CheckLevel,
+    detail: string,
+    fix: string,
+    // A risk that does not make the check fail.
+    warning: string,
+    // The button's label and the id the Rust side maps back to the work; empty without a button.
+    action: string,
+    action-id: string,
+}
+
+global Palette {
+    out property <color> window: #12151a;
+    out property <color> card: #1b1f26;
+    out property <color> code: #0f1115;
+    out property <color> code-border: #2a2f37;
+    out property <color> text: #e6edf3;
+    out property <color> muted: #9aa4b2;
+    out property <color> ok: #3fb950;
+    out property <color> problem: #f0883e;
+    out property <color> failed: #f85149;
+}
+
+component Badge inherits Rectangle {
+    in property <CheckLevel> level;
+    width: 12px;
+    height: 12px;
+    border-radius: 6px;
+    background: root.level == CheckLevel.ok ? Palette.ok : Palette.problem;
+}
+
+// Selectable so commands can be copied with the mouse.
+component CodeBlock inherits Rectangle {
+    in property <string> text;
+    in property <color> text-color: #c9d1d9;
+    background: Palette.code;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: Palette.code-border;
+
+    VerticalLayout {
+        padding: 10px;
+
+        TextInput {
+            text: root.text;
+            read-only: true;
+            wrap: word-wrap;
+            font-family: "monospace";
+            font-size: 12px;
+            color: root.text-color;
+            selection-background-color: #1f6feb;
+        }
+    }
+}
+
+component CardHeader inherits HorizontalLayout {
+    in property <string> title;
+    in property <CheckLevel> level;
+    spacing: 10px;
+
+    VerticalLayout {
+        alignment: center;
+
+        Badge {
+            level: root.level;
+        }
+    }
+
+    Text {
+        text: root.title;
+        font-size: 15px;
+        font-weight: 600;
+        color: Palette.text;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        horizontal-stretch: 1;
+    }
+
+    Text {
+        text: root.level == CheckLevel.ok ? "Ready" : "Action needed";
+        font-size: 12px;
+        color: root.level == CheckLevel.ok ? Palette.ok : Palette.problem;
+        vertical-alignment: center;
+    }
+}
+
+component CheckCard inherits Rectangle {
+    in property <CheckItem> item;
+    // Some work is running, which blocks every button.
+    in property <bool> busy;
+    // The id of the action that is running, so only its own button shows progress.
+    in property <string> running;
+    callback run(string);
+    background: Palette.card;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: root.item.level == CheckLevel.ok ? #263038 : #5a3a22;
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 8px;
+
+        CardHeader {
+            title: root.item.title;
+            level: root.item.level;
+        }
+
+        Text {
+            text: root.item.detail;
+            wrap: word-wrap;
+            font-size: 13px;
+            color: Palette.muted;
+        }
+
+        if root.item.warning != "": Text {
+            text: "Warning: " + root.item.warning;
+            wrap: word-wrap;
+            font-size: 13px;
+            color: Palette.problem;
+        }
+
+        if root.item.fix != "": CodeBlock {
+            text: root.item.fix;
+        }
+
+        if root.item.action != "": HorizontalLayout {
+            spacing: 12px;
+            alignment: start;
+
+            Button {
+                text: root.running == root.item.action-id ? "Working..." : root.item.action;
+                primary: true;
+                enabled: !root.busy;
+                clicked => { root.run(root.item.action-id); }
+            }
+
+            if root.running == root.item.action-id: ProgressIndicator {
+                indeterminate: true;
+                width: 240px;
+            }
+        }
+    }
+}
+
+component RuntimeCard inherits Rectangle {
+    in property <CheckLevel> level;
+    in property <string> detail;
+    in property <string> fix;
+    in property <string> action;
+    in property <bool> can-regenerate;
+    in property <bool> busy;
+    // Other work is running, so the button waits.
+    in property <bool> blocked;
+    in property <string> log;
+    in property <bool> log-failed;
+    callback provision();
+    callback regenerate();
+
+    background: Palette.card;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: root.level == CheckLevel.ok ? #263038 : #5a3a22;
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 8px;
+
+        CardHeader {
+            title: "Private runtime";
+            level: root.level;
+        }
+
+        Text {
+            text: root.detail;
+            wrap: word-wrap;
+            font-size: 13px;
+            color: Palette.muted;
+        }
+
+        if root.fix != "": CodeBlock {
+            text: root.fix;
+        }
+
+        if root.action != "" || root.can-regenerate || root.busy: HorizontalLayout {
+            spacing: 12px;
+            alignment: start;
+
+            if root.action != "": Button {
+                text: root.busy ? "Working..." : root.action;
+                primary: true;
+                enabled: !root.busy && !root.blocked;
+                clicked => { root.provision(); }
+            }
+
+            if root.can-regenerate: Button {
+                text: root.busy ? "Working..." : "Regenerate runtime";
+                enabled: !root.busy && !root.blocked;
+                clicked => { root.regenerate(); }
+            }
+
+            if root.busy: ProgressIndicator {
+                indeterminate: true;
+                width: 240px;
+            }
+        }
+
+        if root.log != "": CodeBlock {
+            text: root.log;
+            text-color: root.log-failed ? Palette.failed : #c9d1d9;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Pingu Launcher";
+    preferred-width: 760px;
+    preferred-height: 780px;
+    min-width: 520px;
+    min-height: 420px;
+    background: Palette.window;
+
+    in property <[CheckItem]> checks;
+    in property <string> headline;
+    in property <string> subline;
+    in property <string> mode-text;
+    in property <bool> all-ok;
+    in property <bool> has-command;
+    in property <bool> has-runtime;
+    // Modules or their boot loading are installed, so there is something to remove.
+    in property <bool> has-installation;
+    in-out property <bool> confirming-uninstall;
+    in property <CheckLevel> runtime-level;
+    in property <string> runtime-detail;
+    in property <string> runtime-fix;
+    in property <string> runtime-action;
+    in property <bool> runtime-can-regenerate;
+    // Read back by the Rust side when starting a runtime build.
+    in property <string> runtime-gpu;
+    in property <string> host-glibc;
+    in property <string> report-text;
+    in-out property <bool> busy;
+    // Which kind of work `busy` stands for: the runtime build, or the id of a check's action.
+    in-out property <bool> provisioning;
+    in-out property <string> running-action;
+    in-out property <string> log;
+    in-out property <bool> log-failed;
+    in-out property <string> action-log;
+    in-out property <bool> action-failed;
+
+    callback recheck();
+    callback check-action(string);
+    callback uninstall();
+    callback provision();
+    callback regenerate();
+    callback launch();
+    callback quit();
+
+    // Slint has no direct clipboard API, so copy through a hidden TextInput.
+    report-clipboard := TextInput {
+        visible: false;
+        read-only: true;
+        text: root.report-text;
+    }
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 14px;
+
+        HorizontalLayout {
+            spacing: 14px;
+
+            Rectangle {
+                width: 44px;
+                height: 44px;
+                border-radius: 22px;
+                background: root.all-ok ? Palette.ok : Palette.problem;
+
+                Text {
+                    text: root.all-ok ? "✓" : "!";
+                    font-size: 24px;
+                    font-weight: 700;
+                    color: #0b0d10;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+
+                Text {
+                    text: root.headline;
+                    font-size: 22px;
+                    font-weight: 700;
+                    color: Palette.text;
+                }
+
+                Text {
+                    text: root.subline;
+                    wrap: word-wrap;
+                    font-size: 13px;
+                    color: Palette.muted;
+                }
+
+                Text {
+                    text: root.mode-text;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                    color: #6e7a8a;
+                }
+            }
+        }
+
+        ScrollView {
+            VerticalLayout {
+                spacing: 10px;
+                alignment: start;
+                padding-right: 6px;
+
+                for item in root.checks: CheckCard {
+                    item: item;
+                    busy: root.busy;
+                    running: root.running-action;
+                    run(id) => { root.check-action(id); }
+                }
+
+                if root.action-log != "": CodeBlock {
+                    text: root.action-log;
+                    text-color: root.action-failed ? Palette.failed : #c9d1d9;
+                }
+
+                if root.has-runtime: RuntimeCard {
+                    level: root.runtime-level;
+                    detail: root.runtime-detail;
+                    fix: root.runtime-fix;
+                    action: root.runtime-action;
+                    can-regenerate: root.runtime-can-regenerate;
+                    busy: root.provisioning;
+                    blocked: root.busy && !root.provisioning;
+                    log: root.log;
+                    log-failed: root.log-failed;
+                    provision => { root.provision(); }
+                    regenerate => { root.regenerate(); }
+                }
+            }
+        }
+
+        if root.confirming-uninstall: HorizontalLayout {
+            spacing: 10px;
+
+            Text {
+                text: "Remove the installed kernel modules and their loading at boot? Your data directory stays.";
+                wrap: word-wrap;
+                font-size: 13px;
+                color: Palette.problem;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: "Yes, uninstall";
+                primary: true;
+                clicked => {
+                    root.confirming-uninstall = false;
+                    root.uninstall();
+                }
+            }
+
+            Button {
+                text: "Cancel";
+                clicked => { root.confirming-uninstall = false; }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+
+            Button {
+                text: "Uninstall";
+                enabled: root.has-installation && !root.busy && !root.confirming-uninstall;
+                clicked => { root.confirming-uninstall = true; }
+            }
+
+            Button {
+                text: "Check again";
+                enabled: !root.busy;
+                clicked => { root.recheck(); }
+            }
+
+            Button {
+                text: "Copy report";
+                clicked => {
+                    report-clipboard.select-all();
+                    report-clipboard.copy();
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: "Quit";
+                clicked => { root.quit(); }
+            }
+
+            if root.has-command: Button {
+                text: "Launch";
+                primary: true;
+                enabled: root.all-ok && !root.busy;
+                clicked => { root.launch(); }
+            }
+        }
+    }
+}

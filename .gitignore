@@ -1,0 +1,8 @@
+/research/
+/.work/
+/build/
+__pycache__/
+*.pyc
+/launcher/target/
+/pingu-hook/target/
+/module-tool/target/
