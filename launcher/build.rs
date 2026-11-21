@@ -5,19 +5,21 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Files of the pingu-policy DKMS package.
-const MODULE_FILES: [&str; 8] = [
+const MODULE_FILES: [&str; 12] = [
     "Makefile",
     "dkms.conf",
     "probe.c",
     "policy.c",
     "policy.h",
     "trampoline.S",
+    "umip.c",
+    "cpuid_fault.c",
+    "svm_capture_context.S",
+    "svm_run_vm.S",
     "README.md",
     "validation",
 ];
-const MODULE_DIRS: [&str; 1] = ["modules-load.d"];
-/// Files of the cpuid_fault_emulation DKMS package.
-const CPUID_FILES: [&str; 5] = ["Makefile", "dkms.conf", "README.md", "inc", "src"];
+const MODULE_DIRS: [&str; 2] = ["modules-load.d", "inc"];
 const LOCKS: [&str; 3] = ["nvidia", "amd", "intel"];
 
 fn main() {
@@ -43,13 +45,6 @@ fn main() {
     }
     for name in MODULE_DIRS {
         add_tree(&mut source, &module, Path::new(name));
-    }
-    source.push_str("];\n");
-
-    source.push_str("pub static CPUID_MODULE_FILES: &[Asset] = &[\n");
-    let cpuid_module = root.join("cpuid-fault");
-    for name in CPUID_FILES {
-        add_tree(&mut source, &cpuid_module, Path::new(name));
     }
     source.push_str("];\n");
 
@@ -117,12 +112,7 @@ fn add_steamos_builds(source: &mut String, directory: &Path) {
         .collect();
     builds.sort();
     for build in builds {
-        for name in [
-            "pingu_policy.ko",
-            "cpuid_fault_emulation.ko",
-            "SHA256SUMS",
-            "source.json",
-        ] {
+        for name in ["pingu_policy.ko", "SHA256SUMS", "source.json"] {
             add_tree(source, directory, &Path::new(&build).join(name));
         }
     }

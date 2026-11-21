@@ -30,11 +30,6 @@ pub fn module_version() -> String {
     dkms_version(MODULE_FILES)
 }
 
-/// Package version of the embedded cpuid_fault_emulation DKMS config.
-pub fn cpuid_module_version() -> String {
-    dkms_version(CPUID_MODULE_FILES)
-}
-
 fn dkms_version(files: &[Asset]) -> String {
     files
         .iter()
@@ -82,19 +77,9 @@ pub fn export_module(destination: &Path) -> Result<Vec<PathBuf>, String> {
     export_files(MODULE_FILES, destination)
 }
 
-/// Writes the cpuid_fault_emulation DKMS package below `destination`.
-pub fn export_cpuid_module(destination: &Path) -> Result<Vec<PathBuf>, String> {
-    export_files(CPUID_MODULE_FILES, destination)
-}
-
 /// Whether `destination` holds exactly the embedded pingu-policy sources and nothing else.
 pub fn module_sources_match(destination: &Path) -> bool {
     sources_match(MODULE_FILES, destination)
-}
-
-/// Whether `destination` holds exactly the embedded cpuid_fault_emulation sources and nothing else.
-pub fn cpuid_module_sources_match(destination: &Path) -> bool {
-    sources_match(CPUID_MODULE_FILES, destination)
 }
 
 fn sources_match(files: &[Asset], destination: &Path) -> bool {
@@ -157,10 +142,15 @@ mod tests {
     }
 
     #[test]
-    fn cpuid_module_is_embedded() {
-        assert!(!cpuid_module_version().is_empty());
-        for path in ["Makefile", "src/cpuid_fault_emulation.c", "src/run_vm.S"] {
-            assert!(CPUID_MODULE_FILES.iter().any(|asset| asset.path == path));
+    fn the_module_package_carries_the_merged_sources() {
+        for path in [
+            "Makefile",
+            "umip.c",
+            "cpuid_fault.c",
+            "svm_run_vm.S",
+            "inc/vmcb_layout.h",
+        ] {
+            assert!(module_file(path).is_some(), "{path}");
         }
     }
 

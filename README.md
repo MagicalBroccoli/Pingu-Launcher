@@ -43,13 +43,14 @@ itself:
 
 - **Install DKMS module** builds, tests and loads the `pingu-policy` kernel module
   (it needs `dkms` and `pkexec` and asks for your password once). On SteamOS the button
-  reads **Install prebuilt module**.
-- **Install DKMS module** on the CPUID faulting card is only shown on AMD CPUs that
-  cannot fault CPUID natively.
+  reads **Install prebuilt module**. The same module handles UMIP and, on AMD CPUs that
+  cannot fault CPUID, the CPUID faulting emulation.
 - **Generate runtime** builds the private library runtime on hosts whose packages contain
   AVX-512 code.
-- Kernel command line changes (`clearcpuid=umip`, and `fred=off ibt=off` when your CPU
-  reports them) and reboots are shown as steps to do by hand.
+- A **Deprecated setup** card appears when the previous setup is still there (the
+  `cpuid_fault_emulation` module, `clearcpuid=umip`, `fred=off`, `ibt=off`) and lists
+  the steps to migrate. Kernel command line changes and reboots are shown as steps to do
+  by hand.
 
 Press **Check again** after each step. When the headline reads **Ready to play**, the
 machine is set up. **Copy report** puts the check results on the clipboard for bug
@@ -131,10 +132,12 @@ CachyOS), which is when the private runtime is needed.
   compiler that built the kernel and DKMS. QEMU with KVM is optional but strongly
   recommended: it runs the VM test, and without it the module is built untested.
   Package names for other distributions are in [pingu-policy/README.md](pingu-policy/README.md).
-- The kernel must run without FRED and IBT. A CPU that reports either needs
-  `fred=off ibt=off` on the kernel command line. UMIP must be disabled with
-  `clearcpuid=umip`, and the CPU must support CPUID faulting (AMD CPUs without it need
-  the `cpuid_fault_emulation` module).
+- No kernel command line change is needed: `pingu_policy` reports the limits of a system
+  without UMIP itself, emulates CPUID faulting on AMD CPUs without it (a CPU that cannot
+  be emulated needs one with native support), hooks the FRED entry points and switches
+  kernel IBT off while it is loaded. `clearcpuid=umip`, `fred=off`, `ibt=off` and the old
+  `cpuid_fault_emulation` module are deprecated; see
+  [docs/cli.md](docs/cli.md#migrating-from-cpuid_fault_emulation-and-clearcpuidumip).
 - The private runtime is only needed on hosts whose packages contain AVX-512 code
   (x86-64-v4 or znver4 repositories, such as CachyOS). Building it needs Arch
   Linux/CachyOS with `pacman`, `curl`, `gnupg`, `libarchive` and `archlinux-keyring`.
@@ -162,8 +165,7 @@ Lutris/Steam -> pingu-launcher -> bubblewrap (generic library overlay)
 |---|---|
 | `pingu-launcher` | Window and command line: checks, setup help, the Lutris/Steam wrapper and the runtime builder |
 | `pingu-hook` | `LD_PRELOAD` library for CPU profile, system data, clocks and signals ([pingu-hook/](pingu-hook/README.md)) |
-| `pingu-policy` | Experimental DKMS kernel module that switches XCR0 for an opted-in process tree |
-| `cpuid_fault_emulation` | Experimental DKMS kernel module that emulates CPUID faulting on AMD CPUs without it |
+| `pingu-policy` | Experimental DKMS kernel module: XCR0 for an opted-in process tree, real `SGDT`/`SIDT` limits under UMIP and CPUID faulting emulation on AMD CPUs without it |
 | Private runtime | Generic Arch libraries that replace AVX-512-required host libraries (Arch/CachyOS only) |
 
 The module is built against the installed kernel, not by rebuilding Linux. DKMS
@@ -214,8 +216,8 @@ make launcher-dist       # like a release: Debian 11 container (podman), SteamOS
 - `launcher/`: `pingu-launcher`. `cargo test` needs the module fixtures
   (`make module-validation-assets`); `make launcher-check` does both.
 - `pingu-hook/`: the preload library, built by the launcher's build script.
-- `pingu-policy/`: DKMS source of the XCR0 module and its validation fixtures.
-- `cpuid-fault/`: DKMS source of the CPUID faulting emulation module.
+- `pingu-policy/`: DKMS source of the module (XCR0 policy, UMIP fixup, CPUID faulting
+  emulation) and its validation fixtures.
 - `module-tool/`: the static helper that plans the kernel patches and runs the VM test
   (`make module-profile-check` tests it).
 - `tools/`, `tests/`: static helper programs and the module's regression tests

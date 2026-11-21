@@ -13,8 +13,8 @@ runs COMMAND. If something is missing, a window explains what to fix.
 The game directory is scanned for artifact.dll. Found means Artifact mode,
 otherwise Legacy mode. Without a COMMAND nothing is scanned and Artifact mode is
 assumed. Legacy mode needs UMIP off, CPUID faulting and the hook.
-Artifact mode needs the same and, when the native XCR0 is not 7, also FRED and
-IBT off, the pingu_policy module and (on AVX-512 optimized hosts) the private
+Artifact mode needs the same and, when the native XCR0 is not 7, also the
+pingu_policy module and (on AVX-512 optimized hosts) the private
 runtime. The restriction is applied by wrapping COMMAND (Lutris's umu-run or
 Steam's expanded %command%) in a companion Proton.
 
@@ -39,10 +39,8 @@ Tools:
                        Select a generation through its <gpu>-current link
   runtime audit PATH   Recheck the library closure of a generation
   module export DIR    Write the pingu-policy DKMS sources to DIR
-  module export-cpuid DIR
-                       Write the cpuid_fault_emulation DKMS sources to DIR
-  module install       Install, test and load pingu-policy through DKMS (needs root)
-  module install-cpuid Install and load cpuid_fault_emulation through DKMS (needs root)
+  module install       Install, test and load pingu-policy through DKMS (needs root); also
+                       removes the deprecated cpuid_fault_emulation package
   module uninstall     Remove the installed modules and their loading at boot (needs root)
   selftest             Run the native module test (needs the loaded module)
   prepare PROTON_DIR   Print the companion Proton the wrapper would use
@@ -87,12 +85,7 @@ pub enum Tool {
     ExportModule {
         destination: PathBuf,
     },
-    ExportCpuidModule {
-        destination: PathBuf,
-    },
-    InstallModule {
-        cpuid: bool,
-    },
+    InstallModule,
     UninstallModules,
     Selftest,
     Prepare {
@@ -178,16 +171,12 @@ fn parse_tool(name: &str, args: Vec<String>) -> Result<Tool, String> {
         ("module", "export") => Ok(Tool::ExportModule {
             destination: one("module export", positional)?,
         }),
-        ("module", "export-cpuid") => Ok(Tool::ExportCpuidModule {
-            destination: one("module export-cpuid", positional)?,
-        }),
+        ("module", "export-cpuid" | "install-cpuid") => Err(format!(
+            "module {subcommand} was removed: pingu_policy emulates CPUID faulting itself now. Run `pingu-launcher module install` and remove cpuid_fault_emulation (`pingu-launcher --check` lists the steps)."
+        )),
         ("module", "install") => {
             none(&positional)?;
-            Ok(Tool::InstallModule { cpuid: false })
-        }
-        ("module", "install-cpuid") => {
-            none(&positional)?;
-            Ok(Tool::InstallModule { cpuid: true })
+            Ok(Tool::InstallModule)
         }
         ("module", "uninstall") => {
             none(&positional)?;
@@ -378,21 +367,14 @@ mod tests {
                 destination: "/d".into()
             }
         );
-        assert_eq!(
-            tool(&["module", "export-cpuid", "/d"]),
-            Tool::ExportCpuidModule {
-                destination: "/d".into()
-            }
-        );
-        assert_eq!(
-            tool(&["module", "install"]),
-            Tool::InstallModule { cpuid: false }
-        );
+        assert_eq!(tool(&["module", "install"]), Tool::InstallModule);
         assert_eq!(tool(&["module", "uninstall"]), Tool::UninstallModules);
-        assert_eq!(
-            tool(&["module", "install-cpuid"]),
-            Tool::InstallModule { cpuid: true }
-        );
+        for removed in ["export-cpuid", "install-cpuid"] {
+            match parse(words(&["module", removed])) {
+                Parsed::Error(message) => assert!(message.contains("module install"), "{message}"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
         assert_eq!(tool(&["selftest"]), Tool::Selftest);
         assert_eq!(
             tool(&["prepare", "/p"]),

@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 use std::path::PathBuf;
 
-use pingu_launcher::assets::Asset;
+use pingu_launcher::assets::{self, Asset};
 use pingu_launcher::checks::{self, Action, Bootloader, Check, Report, Status};
 use pingu_launcher::mode::GameMode;
 use pingu_launcher::runtime::{RuntimeMode, RuntimeState};
@@ -60,22 +60,17 @@ fn legacy_mode_still_needs_its_three_requirements() {
         "proc/cpuinfo",
         "vendor_id\t: GenuineIntel\nflags\t\t: umip\n",
     );
-    fixture.write("proc/cmdline", "root=/dev/sda1\n");
+    fixture.remove("sys/module/pingu_policy");
     fixture.sys.cpuid_faulting = no_faulting;
     fixture.break_hook();
     let report = fixture.report_in(GameMode::Legacy);
     assert_problem(&report, "UMIP");
     assert_problem(&report, "CPUID faulting");
     assert_problem(&report, "pingu-hook");
-    // The command line card follows UMIP even without the restriction.
+    // An active UMIP needs the module even without the restriction.
     assert_eq!(
         titles(&report),
-        [
-            "UMIP",
-            "Kernel command line",
-            "CPUID faulting",
-            "pingu-hook"
-        ]
+        ["UMIP", "CPUID faulting", "pingu-hook", "pingu-policy"]
     );
 }
 
@@ -101,14 +96,7 @@ fn artifact_mode_with_a_wide_native_xcr0_adds_the_restriction_checks() {
     let report = fixture.report();
     assert_eq!(
         titles(&report),
-        [
-            "UMIP",
-            "CPUID faulting",
-            "pingu-hook",
-            "FRED",
-            "IBT",
-            "pingu-policy"
-        ]
+        ["UMIP", "CPUID faulting", "pingu-hook", "pingu-policy"]
     );
     assert!(report.runtime.is_some() && report.plan.policy);
     assert!(report.plan.describe().contains("0x2e7"));
@@ -132,68 +120,136 @@ fn avx2_policy_zero_turns_the_restriction_off() {
 }
 
 #[test]
-fn active_umip_asks_for_clearcpuid_and_names_the_bootloader() {
+fn active_umip_needs_the_module_and_its_card_appears_in_every_mode() {
     let fixture = Fixture::healthy("umip");
     fixture.write(
         "proc/cpuinfo",
         "vendor_id\t: AuthenticAMD\nflags\t\t: fpu umip svm\n",
     );
-    fixture.write("proc/cmdline", "BOOT_IMAGE=/vmlinuz root=/dev/sda1\n");
-    fixture.write("etc/default/grub", "");
-    let report = fixture.report();
-    assert_problem(&report, "UMIP");
-    let cmdline = assert_problem(&report, "Kernel command line");
-    assert!(cmdline.detail.contains("clearcpuid=umip"));
-    assert!(
-        cmdline.fix.contains("GRUB_CMDLINE_LINUX_DEFAULT") && cmdline.fix.contains("grub-mkconfig")
-    );
+    fixture.remove("sys/module/pingu_policy");
+    let report = fixture.report_in(GameMode::Legacy);
+    let umip = assert_problem(&report, "UMIP");
+    assert!(umip.fix.contains("pingu_policy"), "{}", umip.fix);
+    assert_problem(&report, "pingu-policy");
     assert!(!report.ok());
 }
 
 #[test]
-fn fred_and_ibt_are_combined_into_one_instruction() {
-    let fixture = Fixture::healthy("fred-ibt");
-    fixture.write(
-        "proc/cpuinfo",
-        "vendor_id\t: GenuineIntel\nflags\t\t: fpu fred ibt\n",
-    );
-    fixture.write("etc/sdboot-manage.conf", "");
-    let report = fixture.report();
-    assert_problem(&report, "FRED");
-    assert_problem(&report, "IBT");
-    let cmdline = assert_problem(&report, "Kernel command line");
-    assert!(
-        cmdline.detail.contains("fred=off ibt=off"),
-        "{}",
-        cmdline.detail
-    );
-    assert!(cmdline.fix.contains("sdboot-manage gen"));
-    // The module cannot load until the kernel command line is fixed.
-    fixture.remove("sys/module/pingu_policy");
-    let report = fixture.report();
-    assert!(
-        assert_problem(&report, "pingu-policy")
-            .fix
-            .contains("Fix the kernel command line first")
-    );
-}
-
-#[test]
-fn flag_still_active_after_parameter_added_asks_for_reboot() {
-    let fixture = Fixture::healthy("reboot");
+fn the_module_handles_an_active_umip_without_a_boot_parameter() {
+    let fixture = Fixture::healthy("umip-handled");
     fixture.write(
         "proc/cpuinfo",
         "vendor_id\t: AuthenticAMD\nflags\t\t: fpu umip svm\n",
     );
     let report = fixture.report();
-    let umip = assert_problem(&report, "UMIP");
-    assert!(umip.detail.contains("Reboot"));
-    assert!(
-        report
-            .checks
-            .iter()
-            .all(|check| check.title != "Kernel command line")
+    let umip = find(&report, "UMIP");
+    assert_eq!(umip.status, Status::Ok);
+    assert!(umip.detail.contains("pingu_policy"), "{}", umip.detail);
+    assert!(report.ok(), "{}", checks::render_text(&report));
+}
+
+#[test]
+fn fred_and_ibt_need_no_boot_parameters() {
+    let fixture = Fixture::healthy("fred-ibt");
+    fixture.write(
+        "proc/cpuinfo",
+        "vendor_id\t: GenuineIntel\nflags\t\t: fpu fred ibt\n",
     );
+    let report = fixture.report();
+    assert_eq!(
+        titles(&report),
+        ["UMIP", "CPUID faulting", "pingu-hook", "pingu-policy"]
+    );
+    assert!(report.ok(), "{}", checks::render_text(&report));
+}
+
+#[test]
+fn umip_still_active_with_the_old_parameter_asks_for_a_reboot() {
+    let fixture = Fixture::healthy("reboot");
+    fixture.write(
+        "proc/cpuinfo",
+        "vendor_id\t: AuthenticAMD\nflags\t\t: fpu umip svm\n",
+    );
+    fixture.write("proc/cmdline", "root=/dev/sda1 clearcpuid=umip\n");
+    fixture.remove("sys/module/pingu_policy/parameters/umip_fixup");
+    let report = fixture.report();
+    let umip = assert_problem(&report, "UMIP");
+    assert!(umip.detail.contains("still active"), "{}", umip.detail);
+    assert!(umip.fix.contains("Reboot"), "{}", umip.fix);
+}
+
+#[test]
+fn deprecated_settings_get_migration_guidance_without_failing_the_check() {
+    let fixture = Fixture::healthy("deprecated");
+    fixture.write(
+        "proc/cmdline",
+        "BOOT_IMAGE=/vmlinuz root=/dev/sda1 clearcpuid=umip fred=off ibt=off\n",
+    );
+    fixture.write("etc/default/grub", "");
+    fixture.write("sys/module/cpuid_fault_emulation/initstate", "live\n");
+    fixture.write("var/lib/dkms/cpuid_fault_emulation/0.1/source", "");
+    let report = fixture.report();
+    let deprecated = find(&report, "Deprecated setup");
+    assert_eq!(deprecated.status, Status::Ok);
+    assert!(
+        deprecated.detail.contains("cpuid_fault_emulation")
+            && deprecated
+                .detail
+                .contains("clearcpuid=umip fred=off ibt=off"),
+        "{}",
+        deprecated.detail
+    );
+    let steps = &deprecated.warning;
+    for needle in [
+        "sudo /opt/pingu-launcher module install",
+        "modprobe -r cpuid_fault_emulation",
+        "GRUB_CMDLINE_LINUX_DEFAULT",
+        "grub-mkconfig",
+        "Reboot",
+    ] {
+        assert!(steps.contains(needle), "{needle} missing in {steps}");
+    }
+    assert!(report.ok(), "{}", checks::render_text(&report));
+    assert!(checks::render_text(&report).contains("[ ok ] Deprecated setup"));
+
+    // A clean machine has no such card.
+    let clean = Fixture::healthy("not-deprecated");
+    assert!(!titles(&clean.report()).contains(&"Deprecated setup"));
+}
+
+#[test]
+fn clearcpuid_umip_is_fine_when_the_module_would_only_serve_umip() {
+    let fixture = Fixture::healthy("umip-only");
+    fixture.write("proc/cmdline", "root=/dev/sda1 clearcpuid=umip fred=off\n");
+    fixture.remove("sys/module/pingu_policy");
+    let report = fixture.report_in(GameMode::Legacy);
+    assert_eq!(titles(&report), ["UMIP", "CPUID faulting", "pingu-hook"]);
+    assert!(report.ok(), "{}", checks::render_text(&report));
+
+    // The same parameters are deprecated once the restriction needs the module anyway.
+    let report = fixture.report();
+    assert!(titles(&report).contains(&"Deprecated setup"));
+    assert!(titles(&report).contains(&"pingu-policy"));
+}
+
+#[test]
+fn dropping_clearcpuid_waits_for_a_module_that_handles_umip() {
+    let fixture = Fixture::healthy("deprecated-order");
+    fixture.write("proc/cmdline", "root=/dev/sda1 clearcpuid=umip\n");
+    fixture.remove("sys/module/pingu_policy/parameters/umip_fixup");
+    let warning = find(&fixture.report(), "Deprecated setup").warning.clone();
+    let install = warning
+        .find("1. Install the current pingu-policy first")
+        .unwrap();
+    assert!(
+        install < warning.find("2. Remove clearcpuid=umip").unwrap(),
+        "{warning}"
+    );
+
+    // Once the module handles UMIP the install step is not needed.
+    fixture.write("sys/module/pingu_policy/parameters/umip_fixup", "Y\n");
+    let warning = find(&fixture.report(), "Deprecated setup").warning.clone();
+    assert!(warning.contains("1. Remove clearcpuid=umip"), "{warning}");
 }
 
 #[test]
@@ -284,38 +340,45 @@ fn colon_in_the_library_path_is_rejected() {
 fn missing_cpuid_faulting_walks_through_the_module_states() {
     let mut fixture = Fixture::healthy("cpuid-faulting");
     fixture.sys.cpuid_faulting = no_faulting;
+    fixture.remove("sys/module/pingu_policy");
 
-    let not_installed = assert_problem(&fixture.report(), "CPUID faulting");
+    // Not loaded yet: the module card carries the install steps and the hypervisor warning.
+    let report = fixture.report();
+    let not_loaded = assert_problem(&report, "CPUID faulting");
     assert!(
-        not_installed
-            .fix
-            .contains("dkms install -m cpuid_fault_emulation -v 0.1")
+        not_loaded.fix.contains("pingu_policy"),
+        "{}",
+        not_loaded.fix
     );
+    let card = assert_problem(&report, "pingu-policy");
     assert!(
-        not_installed
-            .fix
-            .contains("module export-cpuid /usr/src/cpuid_fault_emulation-0.1")
+        card.warning.contains("Save your work first"),
+        "{}",
+        card.warning
     );
 
+    // Loaded, but SVM was taken by KVM.
+    fixture.write("sys/module/pingu_policy/parameters/ready", "Y\n");
     fixture.write(
-        "lib/modules/7.3.3-test/modules.dep",
-        "updates/dkms/cpuid_fault_emulation.ko.zst:\nkernel/other.ko.zst:\n",
+        "sys/module/pingu_policy/parameters/cpuid_fault",
+        "unavailable\n",
     );
-    let installed = assert_problem(&fixture.report(), "CPUID faulting");
+    let blocked = assert_problem(&fixture.report(), "CPUID faulting");
     assert!(
-        installed
-            .fix
-            .starts_with("sudo modprobe cpuid_fault_emulation")
+        blocked.detail.contains("kvm_amd") && blocked.detail.contains("could not emulate"),
+        "{}",
+        blocked.detail
     );
 
-    fixture.write("sys/module/cpuid_fault_emulation/initstate", "live\n");
+    // A module from before the emulation existed.
+    fixture.remove("sys/module/pingu_policy/parameters/cpuid_fault");
     assert!(
         assert_problem(&fixture.report(), "CPUID faulting")
             .detail
-            .contains("still reports no CPUID faulting")
+            .contains("predates")
     );
 
-    fixture.remove("sys/module/cpuid_fault_emulation");
+    fixture.remove("sys/module/pingu_policy");
     fixture.write(
         "proc/cpuinfo",
         "vendor_id\t: GenuineIntel\nflags\t\t: fpu\n",
@@ -328,12 +391,22 @@ fn missing_cpuid_faulting_walks_through_the_module_states() {
 }
 
 #[test]
-fn emulation_module_counts_as_cpuid_faulting() {
-    let fixture = Fixture::healthy("cpuid-emulated");
+fn the_providers_of_cpuid_faulting_are_named() {
+    let fixture = Fixture::healthy("cpuid-providers");
+    let detail = |fixture: &Fixture| find(&fixture.report(), "CPUID faulting").detail.clone();
+    assert!(detail(&fixture).contains("natively"));
+
+    fixture.write(
+        "sys/module/pingu_policy/parameters/cpuid_fault",
+        "emulated\n",
+    );
+    assert!(detail(&fixture).contains("Emulated by the pingu_policy module"));
+
     fixture.write("sys/module/cpuid_fault_emulation/initstate", "live\n");
-    let check = find(&fixture.report(), "CPUID faulting").clone();
+    let report = fixture.report();
+    let check = find(&report, "CPUID faulting");
     assert_eq!(check.status, Status::Ok);
-    assert!(check.detail.contains("cpuid_fault_emulation module"));
+    assert!(check.detail.contains("deprecated cpuid_fault_emulation"));
 }
 
 #[test]
@@ -349,15 +422,16 @@ fn xcr0_module_states() {
 
     fixture.remove("sys/module/pingu_policy");
     let missing = assert_problem(&fixture.report(), "pingu-policy");
+    let version = assets::module_version();
     assert!(
         missing
             .fix
-            .contains("dkms install -m pingu-policy -v 0.4.0")
+            .contains(&format!("dkms install -m pingu-policy -v {version}"))
     );
     assert!(
-        missing
-            .fix
-            .contains("/opt/pingu-launcher module export /usr/src/pingu-policy-0.4.0"),
+        missing.fix.contains(&format!(
+            "/opt/pingu-launcher module export /usr/src/pingu-policy-{version}"
+        )),
         "{}",
         missing.fix
     );
@@ -396,18 +470,11 @@ fn xcr0_module_states() {
 
 const BUILD_ID: &str = "0102030405060708090a0b0c0d0e0f1011121314";
 
-static PREBUILT: &[Asset] = &[
-    Asset {
-        path: "0102030405060708090a0b0c0d0e0f1011121314/pingu_policy.ko",
-        mode: 0o644,
-        data: b"policy module",
-    },
-    Asset {
-        path: "0102030405060708090a0b0c0d0e0f1011121314/cpuid_fault_emulation.ko",
-        mode: 0o644,
-        data: b"cpuid module",
-    },
-];
+static PREBUILT: &[Asset] = &[Asset {
+    path: "0102030405060708090a0b0c0d0e0f1011121314/pingu_policy.ko",
+    mode: 0o644,
+    data: b"policy module",
+}];
 
 /// A SteamOS machine whose kernel has the GNU build ID `BUILD_ID`.
 fn steamos(name: &str) -> Fixture {
@@ -497,29 +564,21 @@ fn steamos_offers_to_install_the_embedded_modules() {
 }
 
 #[test]
-fn steamos_enables_the_cpuid_module_through_the_same_button() {
+fn steamos_offers_the_one_module_for_cpuid_faulting_too() {
     let mut fixture = steamos("steamos-cpuid");
     fixture.sys.steamos_modules = PREBUILT;
     fixture.sys.cpuid_faulting = no_faulting;
     fixture.executable("bin/pkexec");
-    fixture.write(
-        &format!("var/lib/pingu-runtime/modules/{BUILD_ID}/cpuid_fault_emulation.ko"),
-        "cpuid module",
-    );
-    let disabled = assert_problem(&fixture.report(), "CPUID faulting");
+    let report = fixture.report();
     assert!(
-        disabled.fix.contains("module install-cpuid"),
-        "{}",
-        disabled.fix
-    );
-    assert_eq!(disabled.action, Some(Action::InstallCpuidModule));
-    fixture.write("var/lib/pingu-runtime/enable-cpuid-fault", "");
-    let enabled = assert_problem(&fixture.report(), "CPUID faulting");
-    assert!(
-        enabled
+        assert_problem(&report, "CPUID faulting")
             .fix
-            .starts_with("sudo systemctl restart pingu-modules.service")
+            .contains("pingu_policy")
     );
+    let card = assert_problem(&report, "pingu-policy");
+    assert_eq!(card.action, Some(Action::InstallPolicyModule));
+    assert_eq!(card.action_label, "Install prebuilt module");
+    assert!(card.warning.contains("Save your work first"));
 }
 
 #[test]
@@ -547,17 +606,18 @@ fn an_older_loaded_module_fails_the_check_with_update_steps() {
         position("sudo rm /etc/modprobe.d/pingu-policy.conf")
             < position("dkms remove pingu-policy/0.3.0 --all")
     );
+    let version = assets::module_version();
     assert!(
         position("dkms remove pingu-policy/0.3.0 --all")
-            < position("module export /usr/src/pingu-policy-0.4.0")
+            < position(&format!("module export /usr/src/pingu-policy-{version}"))
     );
     assert!(
-        position("dkms add -m pingu-policy -v 0.4.0")
-            < position("dkms install -m pingu-policy -v 0.4.0")
+        position(&format!("dkms add -m pingu-policy -v {version}"))
+            < position(&format!("dkms install -m pingu-policy -v {version}"))
     );
     assert!(check.fix.contains("Then reboot"), "{}", check.fix);
 
-    fixture.write("sys/module/pingu_policy/version", "0.4.0\n");
+    fixture.write("sys/module/pingu_policy/version", &format!("{version}\n"));
     let current = find(&fixture.report(), "pingu-policy").clone();
     assert_eq!(current.status, Status::Ok);
     assert!(current.fix.is_empty(), "{}", current.fix);
@@ -615,13 +675,14 @@ fn a_missing_qemu_is_a_warning_before_the_module_is_built() {
 #[test]
 fn a_loaded_module_built_without_the_vm_test_is_flagged_but_ok() {
     let fixture = Fixture::healthy("loaded-untested");
-    fixture.write("sys/module/pingu_policy/version", "0.4.0\n");
+    let version = assets::module_version();
+    fixture.write("sys/module/pingu_policy/version", &format!("{version}\n"));
     let clean = find(&fixture.report(), "pingu-policy").clone();
     assert_eq!(clean.status, Status::Ok);
     assert_eq!(clean.warning, "");
 
     fixture.write(
-        "var/lib/dkms/pingu-policy/0.4.0/7.3.3-test/x86_64/log/make.log",
+        &format!("var/lib/dkms/pingu-policy/{version}/7.3.3-test/x86_64/log/make.log"),
         "*** WARNING: pingu-policy is built WITHOUT its VM test ***\n",
     );
     let flagged = find(&fixture.report(), "pingu-policy").clone();
@@ -632,7 +693,9 @@ fn a_loaded_module_built_without_the_vm_test_is_flagged_but_ok() {
         flagged.warning
     );
     assert!(
-        flagged.warning.contains("-v 0.4.0 -k 7.3.3-test"),
+        flagged
+            .warning
+            .contains(&format!("-v {version} -k 7.3.3-test")),
         "{}",
         flagged.warning
     );
@@ -642,7 +705,13 @@ fn a_loaded_module_built_without_the_vm_test_is_flagged_but_ok() {
 fn the_report_knows_whether_anything_is_installed() {
     let fixture = Fixture::healthy("report-installed");
     assert!(!fixture.report().installed);
-    fixture.write("var/lib/dkms/pingu-policy/0.4.0/source", "");
+    fixture.write(
+        &format!(
+            "var/lib/dkms/pingu-policy/{}/source",
+            assets::module_version()
+        ),
+        "",
+    );
     assert!(fixture.report().installed);
 }
 
@@ -657,16 +726,16 @@ fn a_missing_dkms_is_named_instead_of_offering_the_button() {
 }
 
 #[test]
-fn no_install_button_while_fred_or_ibt_blocks_the_module() {
-    let fixture = Fixture::healthy("install-blocked");
+fn the_install_button_is_offered_on_fred_and_ibt_machines() {
+    let fixture = Fixture::healthy("install-fred");
     fixture.remove("sys/module/pingu_policy");
     with_install_tools(&fixture);
     fixture.write(
         "proc/cpuinfo",
-        "vendor_id\t: AuthenticAMD\nflags\t\t: fpu avx2 avx512f svm fred\n",
+        "vendor_id\t: AuthenticAMD\nflags\t\t: fpu avx2 avx512f svm fred ibt\n",
     );
     let check = assert_problem(&fixture.report(), "pingu-policy");
-    assert_eq!(check.action, None);
+    assert_eq!(check.action, Some(Action::InstallPolicyModule));
 }
 
 #[test]
@@ -678,7 +747,10 @@ fn an_installed_update_waits_for_the_reboot_instead_of_offering_another_install(
     assert_eq!(check.action, Some(Action::InstallPolicyModule));
 
     fixture.write(
-        "var/lib/dkms/pingu-policy/0.4.0/7.3.3-test/x86_64/module/pingu_policy.ko",
+        &format!(
+            "var/lib/dkms/pingu-policy/{}/7.3.3-test/x86_64/module/pingu_policy.ko",
+            assets::module_version()
+        ),
         "",
     );
     let check = assert_problem(&fixture.report(), "pingu-policy");
@@ -692,16 +764,17 @@ fn an_installed_update_waits_for_the_reboot_instead_of_offering_another_install(
 }
 
 #[test]
-fn the_cpuid_module_check_offers_the_button_with_a_warning() {
+fn the_module_card_warns_before_starting_the_hypervisor() {
     let mut fixture = Fixture::healthy("install-cpuid");
     fixture.sys.cpuid_faulting = no_faulting;
+    fixture.remove("sys/module/pingu_policy");
     with_install_tools(&fixture);
-    let check = assert_problem(&fixture.report(), "CPUID faulting");
-    assert_eq!(check.action, Some(Action::InstallCpuidModule));
+    let check = assert_problem(&fixture.report(), "pingu-policy");
+    assert_eq!(check.action, Some(Action::InstallPolicyModule));
     assert!(
-        check.detail.contains("Save your work first"),
+        check.warning.contains("Save your work first"),
         "{}",
-        check.detail
+        check.warning
     );
 }
 
@@ -890,12 +963,11 @@ fn text_report_names_the_mode_and_lists_every_check() {
         "proc/cpuinfo",
         "vendor_id\t: AuthenticAMD\nflags\t\t: fpu umip svm\n",
     );
-    fixture.write("proc/cmdline", "root=/dev/sda1\n");
+    fixture.remove("sys/module/pingu_policy/parameters/umip_fixup");
     let text = checks::render_text(&fixture.report());
     assert!(text.starts_with("Artifact mode\n"));
     assert!(text.contains("Native XCR0 is 0x2e7"));
     assert!(text.contains("[FAIL] UMIP"));
-    assert!(text.contains("[FAIL] Kernel command line"));
     assert!(text.contains("[ ok ] pingu-hook"));
     assert!(text.contains("[ ok ] Private runtime"));
 }

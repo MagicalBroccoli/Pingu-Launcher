@@ -104,27 +104,12 @@ pub fn run(sys: &Sys, home: &Home, tool: Tool) -> Result<(), String> {
             );
             Ok(())
         }
-        Tool::ExportCpuidModule { destination } => {
-            let written = assets::export_cpuid_module(&destination)?;
-            println!(
-                "Wrote {} files of cpuid_fault_emulation {} to {}",
-                written.len(),
-                assets::cpuid_module_version(),
-                destination.display()
-            );
-            Ok(())
-        }
-        Tool::InstallModule { cpuid } => {
+        Tool::InstallModule => {
             // Root's own helper directory, so a sudo run does not leave root-owned files in a user's home.
             let home = Home {
                 root: sys.path("/var/lib/pingu-runtime"),
             };
-            let module = if cpuid {
-                Module::CpuidFault
-            } else {
-                Module::Policy
-            };
-            install::run(sys, &home, module)
+            install::run(sys, &home, Module::Policy)
         }
         Tool::UninstallModules => install::uninstall(sys),
         Tool::Prepare { proton } => {

@@ -20,32 +20,32 @@ const PKEXEC_REFUSED: i32 = 127;
 /// SteamOS keeps the prebuilt modules and their loader where an update copies them to the new slot.
 const STEAMOS_BASE: &str = "/var/lib/pingu-runtime";
 const STEAMOS_UNIT: &str = "pingu-modules.service";
+/// The module that pingu_policy replaced: its DKMS package, boot loading and SteamOS opt-in file.
+const LEGACY_CPUID_PACKAGE: &str = "cpuid_fault_emulation";
+const LEGACY_CPUID_AUTOLOAD: &str = "/etc/modules-load.d/cpuid_fault_emulation.conf";
+const LEGACY_CPUID_MARKER: &str = "/var/lib/pingu-runtime/enable-cpuid-fault";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Module {
     Policy,
-    CpuidFault,
 }
 
 impl Module {
     pub fn name(self) -> &'static str {
         match self {
             Self::Policy => "pingu_policy",
-            Self::CpuidFault => "cpuid_fault_emulation",
         }
     }
 
     pub fn package(self) -> &'static str {
         match self {
             Self::Policy => "pingu-policy",
-            Self::CpuidFault => "cpuid_fault_emulation",
         }
     }
 
     pub fn version(self) -> String {
         match self {
             Self::Policy => assets::module_version(),
-            Self::CpuidFault => assets::cpuid_module_version(),
         }
     }
 
@@ -53,7 +53,6 @@ impl Module {
     pub fn subcommand(self) -> &'static str {
         match self {
             Self::Policy => "install",
-            Self::CpuidFault => "install-cpuid",
         }
     }
 
@@ -62,10 +61,49 @@ impl Module {
     }
 }
 
+/// What is left of the deprecated cpuid_fault_emulation module on this machine.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LegacyCpuid {
+    pub loaded: bool,
+    /// DKMS versions of the package.
+    pub dkms: Vec<String>,
+    /// Directories below /usr/src.
+    pub sources: Vec<String>,
+    pub autoload: bool,
+    /// The SteamOS file that enabled it at boot.
+    pub marker: bool,
+}
+
+impl LegacyCpuid {
+    pub fn found(&self) -> bool {
+        self.loaded
+            || !self.dkms.is_empty()
+            || !self.sources.is_empty()
+            || self.autoload
+            || self.marker
+    }
+}
+
+pub fn legacy_cpuid(sys: &Sys) -> LegacyCpuid {
+    LegacyCpuid {
+        loaded: sys.module_loaded(LEGACY_CPUID_PACKAGE),
+        dkms: subdirectories(sys, &format!("/var/lib/dkms/{LEGACY_CPUID_PACKAGE}")),
+        sources: subdirectories(sys, "/usr/src")
+            .into_iter()
+            .filter(|name| name.starts_with(&format!("{LEGACY_CPUID_PACKAGE}-")))
+            .collect(),
+        autoload: sys.exists(LEGACY_CPUID_AUTOLOAD),
+        marker: sys.exists(LEGACY_CPUID_MARKER),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
     RemoveFile(&'static str),
-    DkmsRemove { version: String },
+    DkmsRemove {
+        package: &'static str,
+        version: String,
+    },
     RemoveTree(String),
     Export,
     DkmsAdd,
@@ -74,7 +112,6 @@ pub enum Step {
     Selftest,
     Autoload,
     SteamosFiles,
-    EnableCpuidAtBoot,
     Systemd(&'static [&'static str]),
 }
 
@@ -84,10 +121,10 @@ impl Step {
         let version = module.version();
         match self {
             Self::RemoveFile(path) => format!("Removing {path}"),
-            Self::DkmsRemove { version } => format!("Removing {package} {version} from DKMS"),
-            Self::RemoveTree(path) => {
-                format!("Removing {path}, which differs from this launcher's sources")
+            Self::DkmsRemove { package, version } => {
+                format!("Removing {package} {version} from DKMS")
             }
+            Self::RemoveTree(path) => format!("Removing {path}"),
             Self::Export => format!("Writing the {package} {version} sources to /usr/src"),
             Self::DkmsAdd => format!("Adding {package} {version} to DKMS"),
             Self::DkmsInstall => format!(
@@ -97,7 +134,6 @@ impl Step {
             Self::Selftest => "Running the native self test".to_string(),
             Self::Autoload => format!("Loading {} on every boot", module.name()),
             Self::SteamosFiles => "Installing the prebuilt modules and their loader".to_string(),
-            Self::EnableCpuidAtBoot => "Enabling cpuid_fault_emulation at boot".to_string(),
             Self::Systemd(arguments) => format!("systemctl {}", arguments.join(" ")),
         }
     }
@@ -228,7 +264,6 @@ fn sources_match(sys: &Sys, module: Module, source: &str) -> bool {
     let directory = sys.path(source);
     match module {
         Module::Policy => assets::module_sources_match(&directory),
-        Module::CpuidFault => assets::cpuid_module_sources_match(&directory),
     }
 }
 
@@ -245,17 +280,32 @@ pub fn plan(sys: &Sys, module: Module) -> Vec<Step> {
     }
     let version = module.version();
     let mut steps = Vec::new();
-    if module == Module::Policy {
-        // Versions before 0.4.0 needed options that the module no longer accepts.
-        if sys.exists(OPTIONS_FILE) {
-            steps.push(Step::RemoveFile(OPTIONS_FILE));
-        }
-        if let Some(loaded) = loaded_version(sys, module)
-            && loaded != version
-            && sys.exists(&module.dkms_tree(&loaded))
-        {
-            steps.push(Step::DkmsRemove { version: loaded });
-        }
+    // Versions before 0.4.0 needed options that the module no longer accepts.
+    if sys.exists(OPTIONS_FILE) {
+        steps.push(Step::RemoveFile(OPTIONS_FILE));
+    }
+    if let Some(loaded) = loaded_version(sys, module)
+        && loaded != version
+        && sys.exists(&module.dkms_tree(&loaded))
+    {
+        steps.push(Step::DkmsRemove {
+            package: module.package(),
+            version: loaded,
+        });
+    }
+    // pingu_policy took over the deprecated module's work; what is loaded keeps running until reboot.
+    let legacy = legacy_cpuid(sys);
+    for version in legacy.dkms {
+        steps.push(Step::DkmsRemove {
+            package: LEGACY_CPUID_PACKAGE,
+            version,
+        });
+    }
+    for name in legacy.sources {
+        steps.push(Step::RemoveTree(format!("/usr/src/{name}")));
+    }
+    if legacy.autoload {
+        steps.push(Step::RemoveFile(LEGACY_CPUID_AUTOLOAD));
     }
     // Sources of the same version that differ (a build from before a fix) are replaced, with
     // DKMS's copy of that version, so the module is built from what this launcher carries.
@@ -265,6 +315,7 @@ pub fn plan(sys: &Sys, module: Module) -> Vec<Step> {
     if replaced {
         if sys.exists(&tree) {
             steps.push(Step::DkmsRemove {
+                package: module.package(),
                 version: version.clone(),
             });
         }
@@ -279,12 +330,9 @@ pub fn plan(sys: &Sys, module: Module) -> Vec<Step> {
     }
     if !sys.module_loaded(module.name()) {
         steps.push(Step::Modprobe);
-        if module == Module::Policy {
-            steps.push(Step::Selftest);
-        }
+        steps.push(Step::Selftest);
     }
-    // The CPUID module runs the whole system as a guest, so enabling it at boot stays a manual step.
-    if module == Module::Policy && !sys.exists(POLICY_AUTOLOAD) {
+    if !sys.exists(POLICY_AUTOLOAD) {
         steps.push(Step::Autoload);
     }
     steps
@@ -292,14 +340,15 @@ pub fn plan(sys: &Sys, module: Module) -> Vec<Step> {
 
 /// SteamOS has no DKMS: the prebuilt modules and the loader are written and the service started.
 fn steamos_plan(sys: &Sys, module: Module) -> Vec<Step> {
-    let mut steps = vec![Step::SteamosFiles];
-    if module == Module::CpuidFault {
-        steps.push(Step::EnableCpuidAtBoot);
+    let mut steps = Vec::new();
+    if legacy_cpuid(sys).marker {
+        steps.push(Step::RemoveFile(LEGACY_CPUID_MARKER));
     }
+    steps.push(Step::SteamosFiles);
     steps.push(Step::Systemd(&["daemon-reload"]));
     steps.push(Step::Systemd(&["enable", STEAMOS_UNIT]));
     steps.push(Step::Systemd(&["restart", STEAMOS_UNIT]));
-    if module == Module::Policy && !sys.module_loaded(module.name()) {
+    if !sys.module_loaded(module.name()) {
         steps.push(Step::Selftest);
     }
     steps
@@ -357,18 +406,14 @@ fn execute(sys: &Sys, home: &Home, module: Module, step: &Step) -> Result<(), St
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(format!("{path}: {error}")),
         },
-        Step::DkmsRemove { version } => external(
+        Step::DkmsRemove { package, version } => external(
             Command::new("dkms").args(["remove", &format!("{package}/{version}"), "--all"]),
             "dkms remove",
         ),
         Step::RemoveTree(path) => remove_path(sys, path, true),
         Step::Export => {
             let destination = sys.path(&format!("/usr/src/{package}-{version}"));
-            match module {
-                Module::Policy => assets::export_module(&destination),
-                Module::CpuidFault => assets::export_cpuid_module(&destination),
-            }
-            .map(|_| ())
+            assets::export_module(&destination).map(|_| ())
         }
         Step::DkmsAdd => external(
             Command::new("dkms").args(["add", "-m", package, "-v", &version]),
@@ -395,10 +440,6 @@ fn execute(sys: &Sys, home: &Home, module: Module, step: &Step) -> Result<(), St
             }),
         Step::Selftest => tools::selftest(sys, home),
         Step::SteamosFiles => write_steamos_files(sys),
-        Step::EnableCpuidAtBoot => {
-            let marker = sys.path(&format!("{STEAMOS_BASE}/enable-cpuid-fault"));
-            fs::write(&marker, "").map_err(|error| format!("{}: {error}", marker.display()))
-        }
         Step::Systemd(arguments) => external(
             Command::new("systemctl").args(*arguments),
             &format!("systemctl {}", arguments[0]),
@@ -438,7 +479,6 @@ pub fn run(sys: &Sys, home: &Home, module: Module) -> Result<(), String> {
     for step in plan(sys, module) {
         println!("==> {}", step.describe(module));
         if step == Step::DkmsInstall
-            && module == Module::Policy
             && let Some(problem) = vm_test_problem(sys)
         {
             println!("WARNING: {}", vm_warning(problem));
@@ -508,8 +548,7 @@ pub fn uninstall_plan(sys: &Sys) -> Vec<Removal> {
         }
         return steps;
     }
-    for module in [Module::Policy, Module::CpuidFault] {
-        let package = module.package();
+    for package in [Module::Policy.package(), LEGACY_CPUID_PACKAGE] {
         for version in subdirectories(sys, &format!("/var/lib/dkms/{package}")) {
             steps.push(Removal::Dkms { package, version });
         }
@@ -519,11 +558,7 @@ pub fn uninstall_plan(sys: &Sys) -> Vec<Removal> {
             }
         }
     }
-    for file in [
-        POLICY_AUTOLOAD,
-        "/etc/modules-load.d/cpuid_fault_emulation.conf",
-        OPTIONS_FILE,
-    ] {
+    for file in [POLICY_AUTOLOAD, LEGACY_CPUID_AUTOLOAD, OPTIONS_FILE] {
         if sys.exists(file) {
             steps.push(Removal::File(file.to_string()));
         }
@@ -688,6 +723,7 @@ mod tests {
             [
                 Step::RemoveFile(OPTIONS_FILE),
                 Step::DkmsRemove {
+                    package: "pingu-policy",
                     version: "0.3.0".into()
                 },
                 Step::Export,
@@ -754,6 +790,7 @@ mod tests {
             plan(&sys, Module::Policy),
             [
                 Step::DkmsRemove {
+                    package: "pingu-policy",
                     version: version.clone()
                 },
                 Step::RemoveTree(format!("/{source}")),
@@ -784,18 +821,36 @@ mod tests {
     }
 
     #[test]
-    fn the_cpuid_module_is_not_enabled_at_boot() {
-        let sys = machine("install-cpuid");
-        let steps = plan(&sys, Module::CpuidFault);
+    fn the_deprecated_cpuid_module_is_removed_but_left_loaded() {
+        let sys = machine("install-legacy-cpuid");
+        write(&sys, "sys/module/cpuid_fault_emulation/version", "");
+        write(&sys, "var/lib/dkms/cpuid_fault_emulation/0.1/source", "");
+        write(&sys, "usr/src/cpuid_fault_emulation-0.1/Makefile", "");
+        write(
+            &sys,
+            "etc/modules-load.d/cpuid_fault_emulation.conf",
+            "cpuid_fault_emulation\n",
+        );
+        let legacy = legacy_cpuid(&sys);
+        assert!(legacy.found() && legacy.loaded && legacy.autoload);
         assert_eq!(
-            steps,
+            plan(&sys, Module::Policy),
             [
+                Step::DkmsRemove {
+                    package: "cpuid_fault_emulation",
+                    version: "0.1".into()
+                },
+                Step::RemoveTree("/usr/src/cpuid_fault_emulation-0.1".into()),
+                Step::RemoveFile(LEGACY_CPUID_AUTOLOAD),
                 Step::Export,
                 Step::DkmsAdd,
                 Step::DkmsInstall,
-                Step::Modprobe
+                Step::Modprobe,
+                Step::Selftest,
+                Step::Autoload
             ]
         );
+        assert!(!legacy_cpuid(&machine("install-no-legacy")).found());
     }
 
     #[test]
@@ -829,18 +884,14 @@ mod tests {
                 .collect::<String>()
         };
         let sums = format!(
-            "{}  pingu_policy.ko\n{}  cpuid_fault_emulation.ko\n",
+            "{}  pingu_policy.ko\n{}  other.ko\n",
             digest(b"policy"),
-            if good {
-                digest(b"cpuid")
-            } else {
-                digest(b"other")
-            }
+            if good { digest(b"other") } else { digest(b"x") }
         );
         Box::leak(
             vec![
                 asset("aa/pingu_policy.ko", b"policy"),
-                asset("aa/cpuid_fault_emulation.ko", b"cpuid"),
+                asset("aa/other.ko", b"other"),
                 asset(
                     "aa/SHA256SUMS",
                     Box::leak(sums.into_bytes().into_boxed_slice()),
@@ -867,9 +918,12 @@ mod tests {
             plan(&sys, Module::Policy),
             [Step::SteamosFiles, reload, enable, restart, Step::Selftest]
         );
-        let cpuid = plan(&sys, Module::CpuidFault);
-        assert_eq!(cpuid[..2], [Step::SteamosFiles, Step::EnableCpuidAtBoot]);
-        assert!(!cpuid.contains(&Step::Selftest));
+        // The opt-in file of the deprecated cpuid module goes away with the new loader.
+        write(&sys, "var/lib/pingu-runtime/enable-cpuid-fault", "");
+        assert_eq!(
+            plan(&sys, Module::Policy)[..2],
+            [Step::RemoveFile(LEGACY_CPUID_MARKER), Step::SteamosFiles]
+        );
     }
 
     #[test]

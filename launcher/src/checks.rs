@@ -18,19 +18,17 @@ pub enum Status {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     InstallPolicyModule,
-    InstallCpuidModule,
 }
 
 impl Action {
     pub fn id(self) -> &'static str {
         match self {
             Self::InstallPolicyModule => "install-policy",
-            Self::InstallCpuidModule => "install-cpuid",
         }
     }
 
     pub fn from_id(id: &str) -> Option<Self> {
-        [Self::InstallPolicyModule, Self::InstallCpuidModule]
+        [Self::InstallPolicyModule]
             .into_iter()
             .find(|action| action.id() == id)
     }
@@ -38,7 +36,6 @@ impl Action {
     pub fn module(self) -> Module {
         match self {
             Self::InstallPolicyModule => Module::Policy,
-            Self::InstallCpuidModule => Module::CpuidFault,
         }
     }
 }
@@ -89,7 +86,7 @@ impl Check {
 pub struct Plan {
     pub mode: GameMode,
     pub native_xcr0: Option<u64>,
-    /// Whether the XCR0 restriction (module, FRED/IBT, runtime) is used.
+    /// Whether the XCR0 restriction (module, runtime) is used.
     pub policy: bool,
     /// pingu-hook's Artifact protocol (PINGU_ARTIFACT_PROTOCOL), which needs XCR0 to be 7 at run time.
     pub artifact_protocol: bool,
@@ -161,67 +158,46 @@ impl Report {
     }
 }
 
-struct Feature {
-    title: &'static str,
-    flag: &'static str,
-    param: &'static str,
-    why: &'static str,
+/// The deprecated module that pingu_policy replaced.
+const LEGACY_CPUID_MODULE: &str = "cpuid_fault_emulation";
+
+/// What the loaded pingu_policy reports about its features; an older module has no such parameters.
+struct PolicyState {
+    loaded: bool,
+    umip_fixup: bool,
+    cpuid_fault: Option<String>,
 }
 
-const FEATURES: [Feature; 3] = [
-    Feature {
-        title: "UMIP",
-        flag: "umip",
-        param: "clearcpuid=umip",
-        why: "it must be disabled",
-    },
-    Feature {
-        title: "FRED",
-        flag: "fred",
-        param: "fred=off",
-        why: "the pingu-policy module refuses to load while it is active",
-    },
-    Feature {
-        title: "IBT",
-        flag: "ibt",
-        param: "ibt=off",
-        why: "the pingu-policy module refuses to load while it is active",
-    },
-];
+impl PolicyState {
+    fn read(sys: &Sys) -> Self {
+        let parameter = |name: &str| {
+            sys.read(&format!("/sys/module/pingu_policy/parameters/{name}"))
+                .map(|text| text.trim().to_string())
+        };
+        Self {
+            loaded: sys.module_loaded("pingu_policy"),
+            umip_fixup: parameter("umip_fixup").as_deref() == Some("Y"),
+            cpuid_fault: parameter("cpuid_fault"),
+        }
+    }
+}
 
 pub fn run_all(sys: &Sys, home: &Home, mode: RuntimeMode, detection: &Detection) -> Report {
     let plan = Plan::new(sys, detection);
     let cpu = CpuInfo::read(sys);
     let params = sys.kernel_params();
-    let features = if plan.policy {
-        &FEATURES[..]
-    } else {
-        &FEATURES[..1]
-    };
 
-    let mut feature_checks = Vec::new();
-    let mut missing_params = Vec::new();
-    for feature in features {
-        let (check, needed) = check_feature(feature, &cpu, &params);
-        feature_checks.push(check);
-        missing_params.extend(needed);
+    let mut checks = vec![
+        check_umip(sys, &cpu, &params),
+        check_cpuid_faulting(sys, &cpu),
+        check_hook(sys, home),
+    ];
+    // The module also serves UMIP and the CPUID faulting emulation, whatever the game mode.
+    let emulation = !(sys.cpuid_faulting)() && can_emulate_cpuid_faulting(&cpu);
+    if plan.policy || cpu.has("umip") || emulation {
+        checks.push(check_policy_module(sys, emulation));
     }
-    let mut feature_checks = feature_checks.into_iter();
-
-    let mut checks = Vec::new();
-    checks.extend(feature_checks.next());
-    checks.push(check_cpuid_faulting(sys, &cpu));
-    checks.push(check_hook(sys, home));
-    if plan.policy {
-        checks.extend(feature_checks);
-        if !missing_params.is_empty() {
-            checks.push(kernel_command_line(sys, &params, &missing_params));
-        }
-        let kernel_blocked = FEATURES.iter().skip(1).any(|feature| cpu.has(feature.flag));
-        checks.push(check_policy_module(sys, kernel_blocked));
-    } else if !missing_params.is_empty() {
-        checks.insert(1, kernel_command_line(sys, &params, &missing_params));
-    }
+    checks.extend(check_deprecated(sys, &params, plan.policy || emulation));
     let runtime = plan.policy.then(|| runtime::detect(sys, home, mode));
     Report {
         plan,
@@ -231,13 +207,115 @@ pub fn run_all(sys: &Sys, home: &Home, mode: RuntimeMode, detection: &Detection)
     }
 }
 
-fn kernel_command_line(sys: &Sys, params: &[String], missing: &[&str]) -> Check {
-    let added = missing.join(" ");
+fn check_umip(sys: &Sys, cpu: &CpuInfo, params: &[String]) -> Check {
+    const TITLE: &str = "UMIP";
+    if !cpu.has("umip") {
+        let note = if has_param(params, "clearcpuid=umip") {
+            "disabled by clearcpuid=umip"
+        } else {
+            "not reported by this CPU"
+        };
+        return Check::ok(TITLE, format!("UMIP is not active ({note})."));
+    }
+    let policy = PolicyState::read(sys);
+    if policy.umip_fixup {
+        return Check::ok(
+            TITLE,
+            "UMIP is active; pingu_policy makes SGDT and SIDT report the limits of a system without it.",
+        );
+    }
+    if has_param(params, "clearcpuid=umip") {
+        return Check::problem(
+            TITLE,
+            "UMIP is still active although clearcpuid=umip is on the kernel command line.",
+            "Reboot after changing the boot configuration, or check that the bootloader passes the parameter. With the current pingu_policy the parameter is no longer needed.",
+        );
+    }
+    if policy.loaded {
+        return Check::problem(
+            TITLE,
+            "UMIP is active and the loaded pingu_policy module does not handle it (an older version, or its hook failed).",
+            "Install the current pingu-policy (see its card) and reboot. If it is current: sudo dmesg | grep -i xcr0_probe",
+        );
+    }
     Check::problem(
-        "Kernel command line",
-        format!("Add {added} to the kernel command line and reboot."),
-        bootloader_steps(detect_bootloader(sys, params), &added),
+        TITLE,
+        "UMIP is active, and the pingu_policy module handles it once it is loaded.",
+        "Install and load pingu_policy (see its card).",
     )
+}
+
+fn numbered(items: &[String]) -> String {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| format!("{}. {item}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Deprecated settings still work, so this card never fails; it tells how to move to pingu_policy.
+/// `module_needed`: the module is wanted for more than UMIP, so the old boot parameters can go.
+fn check_deprecated(sys: &Sys, params: &[String], module_needed: bool) -> Option<Check> {
+    let legacy = install::legacy_cpuid(sys);
+    // With UMIP disabled by the user and nothing else asking for pingu_policy, the parameter is fine.
+    let parameters: Vec<&str> = if module_needed || legacy.found() {
+        ["clearcpuid=umip", "fred=off", "ibt=off"]
+            .into_iter()
+            .filter(|param| has_param(params, param))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !legacy.found() && parameters.is_empty() {
+        return None;
+    }
+    let mut found = Vec::new();
+    let mut steps = Vec::new();
+    // Without the current module, dropping clearcpuid=umip would leave UMIP active and unhandled.
+    let policy = PolicyState::read(sys);
+    let umip_needs_module = parameters.contains(&"clearcpuid=umip") && !policy.umip_fixup;
+    if legacy.found() {
+        found.push("the cpuid_fault_emulation module".to_string());
+    }
+    if legacy.found() || umip_needs_module {
+        let exe = shell_quote(&sys.exe);
+        let mut step = format!(
+            "Install the current pingu-policy first (its card has the button, or run `sudo {exe} module install`). It handles UMIP and emulates CPUID faulting itself."
+        );
+        if legacy.found() {
+            step.push_str(" The installation removes the cpuid_fault_emulation package and its loading at boot.");
+        }
+        if legacy.loaded {
+            step.push_str(" The loaded module keeps working until you reboot; unload it only while no game runs (sudo modprobe -r cpuid_fault_emulation).");
+        }
+        steps.push(step);
+    }
+    if !parameters.is_empty() {
+        let list = parameters.join(" ");
+        found.push(format!("{list} on the kernel command line"));
+        let reason = if parameters.contains(&"clearcpuid=umip") {
+            "pingu_policy handles UMIP, and works with FRED and IBT"
+        } else {
+            "pingu_policy works with FRED and IBT"
+        };
+        let how = bootloader_remove_steps(detect_bootloader(sys, params), &list);
+        steps.push(format!(
+            "Remove {list} from the kernel command line ({reason}). {}",
+            how.replace('\n', "\n   ")
+        ));
+    }
+    steps.push("Reboot, then press Check again.".to_string());
+    Some(Check {
+        warning: format!(
+            "These settings of the previous setup are deprecated and still work. To migrate:\n{}",
+            numbered(&steps)
+        ),
+        ..Check::ok(
+            "Deprecated setup",
+            format!("Found {}.", found.join(" and ")),
+        )
+    })
 }
 
 /// Whether `param` is on the kernel command line; `clearcpuid=` takes a comma separated list.
@@ -249,40 +327,6 @@ pub fn has_param(params: &[String], param: &str) -> bool {
             .any(|list| list.split(',').any(|item| item == wanted)),
         _ => params.iter().any(|candidate| candidate == param),
     }
-}
-
-fn check_feature(
-    feature: &Feature,
-    cpu: &CpuInfo,
-    params: &[String],
-) -> (Check, Option<&'static str>) {
-    let configured = has_param(params, feature.param);
-    if !cpu.has(feature.flag) {
-        let note = if configured {
-            format!("disabled by {}", feature.param)
-        } else {
-            "not reported by this CPU".into()
-        };
-        return (
-            Check::ok(
-                feature.title,
-                format!("{} is not active ({note}).", feature.title),
-            ),
-            None,
-        );
-    }
-    if configured {
-        let detail = format!(
-            "{0} is still active although {1} is on the kernel command line. Reboot after changing the boot configuration, or check that the bootloader passes the parameter.",
-            feature.title, feature.param
-        );
-        return (Check::problem(feature.title, detail, String::new()), None);
-    }
-    let detail = format!("{} is active, but {}.", feature.title, feature.why);
-    (
-        Check::problem(feature.title, detail, String::new()),
-        Some(feature.param),
-    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,22 +355,22 @@ pub fn detect_bootloader(sys: &Sys, params: &[String]) -> Bootloader {
     }
 }
 
-pub fn bootloader_steps(bootloader: Bootloader, added: &str) -> String {
+pub fn bootloader_remove_steps(bootloader: Bootloader, removed: &str) -> String {
     match bootloader {
         Bootloader::Grub => format!(
-            "Append \"{added}\" to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then run:\n  sudo grub-mkconfig -o /boot/grub/grub.cfg\nReboot afterwards."
+            "Delete \"{removed}\" from GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, then run:\n  sudo grub-mkconfig -o /boot/grub/grub.cfg"
         ),
         Bootloader::SdbootManage => format!(
-            "Append \"{added}\" to LINUX_OPTIONS in /etc/sdboot-manage.conf, then run:\n  sudo sdboot-manage gen\nReboot afterwards."
+            "Delete \"{removed}\" from LINUX_OPTIONS in /etc/sdboot-manage.conf, then run:\n  sudo sdboot-manage gen"
         ),
         Bootloader::KernelCmdline => format!(
-            "Append \"{added}\" to /etc/kernel/cmdline, then regenerate your boot entries (on CachyOS: sudo reinstall-kernels).\nReboot afterwards."
+            "Delete \"{removed}\" from /etc/kernel/cmdline, then regenerate your boot entries (on CachyOS: sudo reinstall-kernels)."
         ),
         Bootloader::LoaderEntries => format!(
-            "Append \"{added}\" to the options line of your entry in /boot/loader/entries/ (or /efi/loader/entries/).\nReboot afterwards."
+            "Delete \"{removed}\" from the options line of your entry in /boot/loader/entries/ (or /efi/loader/entries/)."
         ),
         Bootloader::Unknown => {
-            format!("Add \"{added}\" to your bootloader's kernel command line and reboot.")
+            format!("Delete \"{removed}\" from your bootloader's kernel command line.")
         }
     }
 }
@@ -350,82 +394,66 @@ fn check_hook(sys: &Sys, home: &Home) -> Check {
     }
 }
 
+/// Whether the CPU could run the SVM based CPUID faulting emulation of pingu_policy.
+fn can_emulate_cpuid_faulting(cpu: &CpuInfo) -> bool {
+    cpu.vendor == "AuthenticAMD" && cpu.has("svm")
+}
+
 fn check_cpuid_faulting(sys: &Sys, cpu: &CpuInfo) -> Check {
     const TITLE: &str = "CPUID faulting";
-    const MODULE: &str = "cpuid_fault_emulation";
-    let loaded = sys.module_loaded(MODULE);
+    let policy = PolicyState::read(sys);
     if (sys.cpuid_faulting)() {
-        let detail = if loaded {
-            "Provided by the cpuid_fault_emulation module."
+        let detail = if sys.module_loaded(LEGACY_CPUID_MODULE) {
+            "Provided by the deprecated cpuid_fault_emulation module."
+        } else if policy.cpuid_fault.as_deref() == Some("emulated") {
+            "Emulated by the pingu_policy module."
         } else {
-            "Supported natively by this CPU, so the cpuid_fault_emulation module is not needed."
+            "Supported natively by this CPU."
         };
         return Check::ok(TITLE, detail);
     }
-    if loaded {
+    if policy.loaded && policy.cpuid_fault.is_none() {
         return Check::problem(
             TITLE,
-            "The cpuid_fault_emulation module is loaded but the kernel still reports no CPUID faulting.",
-            "Check the kernel log for the reason: sudo dmesg | grep -i cpuid",
+            "The loaded pingu_policy module predates its CPUID faulting emulation.",
+            "Install the current pingu-policy (see its card) and reboot.",
         );
     }
-    if cpu.vendor != "AuthenticAMD" || !cpu.has("svm") {
+    if policy.loaded {
+        let reason = if !can_emulate_cpuid_faulting(cpu) {
+            "The CPU has no usable SVM: only AMD CPUs with SVM (AMD-V enabled in the firmware setup) can be emulated."
+        } else {
+            "SVM is already in use, most likely by kvm_amd, which also runs the KVM guests. Unload kvm_amd and kvm, or keep them from loading, then reboot."
+        };
         return Check::problem(
             TITLE,
-            "This CPU cannot fault CPUID, and the cpuid_fault_emulation module needs an AMD CPU with SVM.",
+            format!(
+                "This CPU cannot fault CPUID natively and pingu_policy could not emulate it. {reason}"
+            ),
+            "The reason is in the kernel log: sudo dmesg | grep -i xcr0_probe",
+        );
+    }
+    if !can_emulate_cpuid_faulting(cpu) {
+        return Check::problem(
+            TITLE,
+            "This CPU cannot fault CPUID, and the pingu_policy emulation needs an AMD CPU with SVM.",
             "If this is an AMD CPU, enable SVM (AMD-V) in the firmware setup. Otherwise CPUID faulting is not available on this machine.",
         );
     }
-    if let Some((detail, fix)) = steamos_problem(sys, Module::CpuidFault) {
-        return offer(
-            sys,
-            Check::problem(TITLE, detail, fix),
-            Action::InstallCpuidModule,
-            false,
-        );
-    }
-    if sys.module_installed(MODULE) {
-        return offer(
-            sys,
-            Check::problem(
-                TITLE,
-                format!(
-                    "This CPU cannot fault CPUID natively. The cpuid_fault_emulation module is installed but not loaded. {SAVE_WORK}"
-                ),
-                format!(
-                    "sudo modprobe {MODULE}\n\nTo load it on every boot:\n  echo {MODULE} | sudo tee /etc/modules-load.d/{MODULE}.conf"
-                ),
-            ),
-            Action::InstallCpuidModule,
-            false,
-        );
-    }
-    let version = assets::cpuid_module_version();
-    let exe = shell_quote(&sys.exe);
-    let source = format!("/usr/src/{MODULE}-{version}");
-    let missing = Check::problem(
+    Check::problem(
         TITLE,
-        format!(
-            "This CPU cannot fault CPUID natively. The cpuid_fault_emulation module is not installed. {SAVE_WORK}"
-        ),
-        format!(
-            "sudo {exe} module export-cpuid {source}\nsudo dkms add -m {MODULE} -v {version}\nsudo dkms install -m {MODULE} -v {version} -k \"$(uname -r)\"\nsudo modprobe {MODULE}\n\nTo load it on every boot:\n  echo {MODULE} | sudo tee /etc/modules-load.d/{MODULE}.conf"
-        ),
-    );
-    offer(sys, missing, Action::InstallCpuidModule, false)
+        "This CPU cannot fault CPUID natively. The pingu_policy module emulates it.",
+        "Install and load pingu_policy (see its card).",
+    )
 }
 
-const SAVE_WORK: &str =
-    "Save your work first: loading it runs the whole system as a guest of a thin hypervisor.";
+const SAVE_WORK: &str = "Save your work first: on this CPU loading it runs the whole system as a guest of a thin hypervisor.";
 
 const DKMS_LABEL: &str = "Install DKMS module";
 const PREBUILT_LABEL: &str = "Install prebuilt module";
 
 /// Adds the install button when the tools are there, or says what is missing.
-fn offer(sys: &Sys, mut check: Check, action: Action, blocked: bool) -> Check {
-    if blocked {
-        return check;
-    }
+fn offer(sys: &Sys, mut check: Check, action: Action) -> Check {
     if sys.is_steamos() {
         // SteamOS has no DKMS; the launcher carries modules built for Valve's kernels.
         if install::prebuilt_available(sys, action.module()) && install::available(sys) {
@@ -479,13 +507,6 @@ fn steamos_problem(sys: &Sys, module: Module) -> Option<(String, String)> {
             command,
         ));
     }
-    if module == Module::CpuidFault && !sys.exists(&format!("{STEAMOS_MODULES}/enable-cpuid-fault"))
-    {
-        return Some((
-            "The cpuid_fault_emulation module is installed but not enabled.".into(),
-            command,
-        ));
-    }
     Some((
         format!("The {name} module is installed for this SteamOS kernel but not loaded."),
         "sudo systemctl restart pingu-modules.service\njournalctl -b -u pingu-modules.service"
@@ -532,7 +553,19 @@ fn module_update_steps(sys: &Sys, loaded: Option<&str>, version: &str) -> String
     text
 }
 
-fn check_policy_module(sys: &Sys, kernel_blocked: bool) -> Check {
+/// The card of the module; `emulation` is true when loading it also starts the CPUID faulting hypervisor.
+fn check_policy_module(sys: &Sys, emulation: bool) -> Check {
+    let mut check = policy_module_state(sys);
+    if emulation && check.status == Status::Problem && !sys.module_loaded("pingu_policy") {
+        if !check.warning.is_empty() {
+            check.warning.push(' ');
+        }
+        check.warning.push_str(SAVE_WORK);
+    }
+    check
+}
+
+fn policy_module_state(sys: &Sys) -> Check {
     const TITLE: &str = "pingu-policy";
     const MODULE: &str = "pingu_policy";
     let version = assets::module_version();
@@ -574,7 +607,6 @@ fn check_policy_module(sys: &Sys, kernel_blocked: bool) -> Check {
                             module_update_steps(sys, Some(&loaded), &version),
                         ),
                         Action::InstallPolicyModule,
-                        kernel_blocked,
                     )
                 }
             }
@@ -592,17 +624,11 @@ fn check_policy_module(sys: &Sys, kernel_blocked: bool) -> Check {
         };
     }
 
-    let blocked = if kernel_blocked {
-        "Fix the kernel command line first; the module refuses to load while FRED or IBT is active.\n\n"
-    } else {
-        ""
-    };
     if let Some((detail, fix)) = steamos_problem(sys, Module::Policy) {
         return offer(
             sys,
-            Check::problem(TITLE, detail, format!("{blocked}{fix}")),
+            Check::problem(TITLE, detail, fix),
             Action::InstallPolicyModule,
-            kernel_blocked,
         );
     }
     let mut notes = String::new();
@@ -622,16 +648,15 @@ fn check_policy_module(sys: &Sys, kernel_blocked: bool) -> Check {
             Check::problem(
                 TITLE,
                 "The pingu_policy module is installed but not loaded.",
-                format!("{notes}{blocked}sudo modprobe {MODULE}\n{persist}"),
+                format!("{notes}sudo modprobe {MODULE}\n{persist}"),
             ),
             Action::InstallPolicyModule,
-            kernel_blocked,
         );
     }
     let mut steps = String::new();
     let _ = write!(
         steps,
-        "{notes}{blocked}sudo {exe} module export {source}\nsudo dkms add -m pingu-policy -v {version}\nsudo dkms install -m pingu-policy -v {version} -k \"$(uname -r)\"\nsudo modprobe {MODULE}\n{persist}"
+        "{notes}sudo {exe} module export {source}\nsudo dkms add -m pingu-policy -v {version}\nsudo dkms install -m pingu-policy -v {version} -k \"$(uname -r)\"\nsudo modprobe {MODULE}\n{persist}"
     );
     offer(
         sys,
@@ -641,7 +666,6 @@ fn check_policy_module(sys: &Sys, kernel_blocked: bool) -> Check {
             steps,
         ),
         Action::InstallPolicyModule,
-        kernel_blocked,
     )
 }
 
@@ -656,8 +680,9 @@ pub fn render_text(report: &Report) -> String {
             "FAIL"
         };
         let _ = writeln!(text, "[{mark}] {}: {}", check.title, check.detail);
-        if !check.warning.is_empty() {
-            let _ = writeln!(text, "         Warning: {}", check.warning);
+        for (index, line) in check.warning.lines().enumerate() {
+            let label = if index == 0 { "Warning: " } else { "         " };
+            let _ = writeln!(text, "         {label}{line}");
         }
         if !check.fix.is_empty() {
             for line in check.fix.lines() {

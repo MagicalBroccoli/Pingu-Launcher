@@ -51,10 +51,15 @@ from its lock. See [runtime.md](runtime.md) for rebuilding exact inputs and upda
 Skip installation if this module version is already installed and ready. Do not
 try to unload an older loaded version. Reboot without autoloading it before
 upgrading, or prepare the new module for a different installed kernel and boot
-that kernel. Version 0.4.0 takes no module parameters: remove
-`/etc/modprobe.d/pingu-policy.conf` of an older version first, because `modprobe`
+that kernel. The module takes no required parameters: remove
+`/etc/modprobe.d/pingu-policy.conf` of version 0.3.0 first, because `modprobe`
 refuses to load the module with its options. When an older version is loaded,
 `pingu-launcher --check` lists the update steps.
+
+The module does three jobs, each only where the machine needs it: the exact XCR0
+restriction (CPUs whose XCR0 is wider than 7), the real `SGDT`/`SIDT` limits while UMIP
+is active (no `clearcpuid=umip`), and CPUID faulting on AMD CPUs without it. It is the
+module that `--check` asks for whenever one of these is needed, in Legacy mode too.
 
 The window's **Install DKMS module** button on the pingu-policy card (it needs `dkms`
 and polkit's `pkexec`, and asks for your password once) runs the same work as:
@@ -63,7 +68,8 @@ and polkit's `pkexec`, and asks for your password once) runs the same work as:
 sudo pingu-launcher module install
 ```
 
-It removes the options file and an older DKMS version, exports the sources, builds and
+It removes the options file, an older DKMS version and the deprecated
+`cpuid_fault_emulation` package with its loading at boot, exports the sources, builds and
 tests the module through DKMS, loads it, runs the self test and enables loading on
 future boots. An older loaded version keeps running until you reboot.
 
@@ -75,9 +81,9 @@ updates. A kernel that is newer than the launcher needs a newer launcher release
 manual steps for other distributions are:
 
 ```sh
-sudo pingu-launcher module export /usr/src/pingu-policy-0.4.0
-sudo dkms add -m pingu-policy -v 0.4.0
-sudo dkms install -m pingu-policy -v 0.4.0 -k "$(uname -r)"
+sudo pingu-launcher module export /usr/src/pingu-policy-0.5.0
+sudo dkms add -m pingu-policy -v 0.5.0
+sudo dkms install -m pingu-policy -v 0.5.0 -k "$(uname -r)"
 ```
 
 DKMS automatically runs static checks and, when QEMU and KVM are available, the full VM
@@ -96,49 +102,47 @@ pingu-launcher selftest
 
 Readiness must be `Y`. If it is `N`, inspect the kernel log and reboot; do not
 force removal. If `modprobe` reports "No such device" and the `ready` file is
-missing, the module declined to load without patching anything: check the
-command-line requirements in the README. Secure Boot requires a module-signing key
+missing, the module declined to load without patching anything (the kernel release
+does not match the build). Secure Boot requires a module-signing key
 trusted by your kernel; use your distribution's DKMS/MOK signing workflow. This
 project does not disable Secure Boot, enroll keys or bypass lockdown.
 
 After successful native testing, optionally enable loading on future boots:
 
 ```sh
-sudo install -Dm644 /usr/src/pingu-policy-0.4.0/modules-load.d/pingu-policy.conf /etc/modules-load.d/pingu-policy.conf
+sudo install -Dm644 /usr/src/pingu-policy-0.5.0/modules-load.d/pingu-policy.conf /etc/modules-load.d/pingu-policy.conf
 ```
 
-See [kernel-module.md](kernel-module.md) for recovery and validation limits.
+See [kernel-module.md](kernel-module.md) for recovery and validation limits. What each
+feature did is readable under `/sys/module/pingu_policy/parameters/`: `xcr0_policy`,
+`umip_fixup` and `cpuid_fault` (`native`, `emulated` or `unavailable`).
 
-## CPUID Faulting Module (AMD Only)
+## CPUID Faulting And UMIP
 
-Skip this if `pingu-launcher --check` reports CPUID faulting as supported natively.
-It is only for AMD CPUs with SVM (AMD-V) enabled in the firmware that cannot fault
-CPUID. The module runs a minimal hypervisor under the kernel, so it refuses to
-load while `kvm_amd` or other SVM users are active. It is not covered by the VM
-gate. Save work and keep a recovery kernel before the first load.
+Both are handled by `pingu_policy` now; nothing needs a separate module or a boot
+parameter. On an AMD CPU with SVM (AMD-V) enabled in the firmware that cannot fault
+CPUID, loading the module starts a minimal hypervisor under the kernel, so it cannot
+start while `kvm_amd` or another SVM user is active (`cpuid_fault` then reads
+`unavailable`, and `--check` says so). Save work and keep a recovery kernel before the
+first load on such a CPU. Other CPUs are not virtualized.
 
-The window offers an **Install DKMS module** button on the CPUID faulting card, and
-`sudo pingu-launcher module install-cpuid` does the same from a terminal. It
-installs and loads the module but does not enable it at boot. The manual steps are:
+## Migrating From cpuid_fault_emulation And clearcpuid=umip
+
+The separate `cpuid_fault_emulation` module and `clearcpuid=umip` (also `fred=off` and
+`ibt=off`, which `pingu_policy` no longer needs) still work, so a machine that has them
+stays usable, but `pingu-launcher --check` adds a "Deprecated setup" card with the steps.
+By hand:
 
 ```sh
-sudo pingu-launcher module export-cpuid /usr/src/cpuid_fault_emulation-0.1
-sudo dkms add -m cpuid_fault_emulation -v 0.1
-sudo dkms install -m cpuid_fault_emulation -v 0.1 -k "$(uname -r)"
-sudo modprobe cpuid_fault_emulation
-pingu-launcher --check --mode legacy
+sudo pingu-launcher module install    # also removes the cpuid_fault_emulation package and its autoload
+sudo modprobe -r cpuid_fault_emulation   # optional, only while no game runs
 ```
 
-The check must now list CPUID faulting as provided by the module. To load it on
-every boot:
-
-```sh
-echo cpuid_fault_emulation | sudo tee /etc/modules-load.d/cpuid_fault_emulation.conf
-```
-
-DKMS rebuilds it for new kernels (`AUTOINSTALL=yes`) without any validation, so
-check the result after each kernel update. Secure Boot requires a trusted module
-signature as for `pingu_policy`. See [kernel-module.md](kernel-module.md#cpuid-fault-emulation).
+Then delete `clearcpuid=umip` (and `fred=off ibt=off`) from the kernel command line of
+your bootloader and reboot. When both modules are loaded the new one leaves CPUID faulting
+to the old one (`cpuid_fault` reads `native`), and when `pingu_policy` loads first the old
+module refuses to start ("SVM already enabled"). `module export-cpuid` and
+`module install-cpuid` no longer exist.
 
 ## Starting Games
 

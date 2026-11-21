@@ -66,12 +66,11 @@ impl Fixture {
             "proc/cpuinfo",
             "processor\t: 0\nvendor_id\t: AuthenticAMD\nflags\t\t: fpu avx2 avx512f svm\n",
         );
-        fixture.write(
-            "proc/cmdline",
-            "initrd=\\initramfs.img root=/dev/sda1 clearcpuid=umip\n",
-        );
+        fixture.write("proc/cmdline", "initrd=\\initramfs.img root=/dev/sda1\n");
         fixture.write("proc/sys/kernel/osrelease", "7.3.3-test\n");
         fixture.write("sys/module/pingu_policy/parameters/ready", "Y\n");
+        fixture.write("sys/module/pingu_policy/parameters/umip_fixup", "Y\n");
+        fixture.write("sys/module/pingu_policy/parameters/cpuid_fault", "native\n");
         fixture.write(
             "var/lib/pacman/local/glibc-2.44-1/desc",
             "%NAME%\nglibc\n\n%VERSION%\n2.44-1\n\n%ARCH%\nx86_64\n",
