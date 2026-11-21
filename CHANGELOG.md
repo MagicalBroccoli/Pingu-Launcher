@@ -1,3 +1,10 @@
+## v0.3.1 (2026-11-21)
+
+### Feat
+
+- **launcher**: install pingu-policy on Bazzite and other ostree images
+- **pingu-policy**: the CPUID faulting emulation runs only while a game needs it, so KVM works in between
+
 ## v0.3.0 (2026-11-21)
 
 ### Feat
