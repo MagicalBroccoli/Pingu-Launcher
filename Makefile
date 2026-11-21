@@ -42,7 +42,7 @@ endef
 
 .DEFAULT_GOAL := all
 .PHONY: all bootstrap test-binaries module-validation-assets
-.PHONY: launcher launcher-check launcher-dist
+.PHONY: launcher launcher-check launcher-dist launcher-screenshot
 .PHONY: test module-profile-check module-probe module-check
 .PHONY: steamos-modules
 
@@ -68,6 +68,11 @@ $(BUILD_DIR)/pingu-launcher: $(LAUNCHER_SOURCES) $(EMBEDDED)
 launcher-check: pingu-policy/validation/manifest.json
 	mkdir -p $(TMPDIR)
 	cargo test --locked --manifest-path launcher/Cargo.toml
+
+# Renders the window of a healthy machine into the README's screenshot, without a display.
+launcher-screenshot: pingu-policy/validation/manifest.json
+	mkdir -p $(TMPDIR)
+	cargo run --locked --manifest-path launcher/Cargo.toml --example screenshot -- $(abspath docs/images/launcher.png)
 
 # A release for other distributions: built on Debian 11, so it needs glibc 2.31 or newer.
 # It embeds the SteamOS modules, which `make steamos-modules` builds and tests first, and

@@ -224,6 +224,8 @@ make launcher-dist       # like a release: Debian 11 container (podman), SteamOS
 
 - `launcher/`: `pingu-launcher`. `cargo test` needs the module fixtures
   (`make module-validation-assets`); `make launcher-check` does both.
+  `make launcher-screenshot` renders the window without a display and updates
+  `docs/images/launcher.png`.
 - `pingu-hook/`: the preload library, built by the launcher's build script.
 - `pingu-policy/`: DKMS source of the module (XCR0 policy, UMIP fixup, CPUID faulting
   emulation) and its validation fixtures.

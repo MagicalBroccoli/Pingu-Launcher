@@ -28,5 +28,14 @@ tar = { version = "0.4", default-features = false }
 [build-dependencies]
 slint-build = "1.18"
 
+# Only the screenshot example renders without a display.
+[dev-dependencies]
+slint = { version = "1.18", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "renderer-software",
+    "software-renderer-systemfonts",
+] }
+
 [profile.release]
 strip = true
