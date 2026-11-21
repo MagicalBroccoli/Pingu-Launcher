@@ -48,11 +48,10 @@ endef
 
 all: launcher
 
-# The launcher embeds the hook, both module packages, the helper programs and the locks.
+# The launcher embeds the hook, the module package, the helper programs and the locks.
 EMBEDDED := pingu-policy/validation/manifest.json \
 	$(wildcard pingu-policy/*.c pingu-policy/*.h pingu-policy/*.S pingu-policy/Makefile pingu-policy/dkms.conf \
-		pingu-policy/README.md pingu-policy/modules-load.d/*) $(MODULE_TOOL) \
-	$(shell find cpuid-fault -type f) \
+		pingu-policy/README.md pingu-policy/inc/* pingu-policy/modules-load.d/*) $(MODULE_TOOL) \
 	$(wildcard runtime/*.lock.json)
 LAUNCHER_SOURCES := launcher/Cargo.toml launcher/Cargo.lock launcher/build.rs \
 	$(wildcard launcher/src/*.rs launcher/ui/*.slint) \

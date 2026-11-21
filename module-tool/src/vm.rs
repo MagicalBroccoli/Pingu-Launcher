@@ -209,7 +209,7 @@ impl Qemu {
         deadlines: Deadlines,
     ) -> Res<Self> {
         let append = "console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 loglevel=5 nopvspin \
-                      rdinit=/init panic=-1 AVX2_MODULE_PROBE=1 ibt=off fred=off \
+                      rdinit=/init panic=-1 AVX2_MODULE_PROBE=1 \
                       AVX2_MODULE_INSTALL_STRESS=1";
         let mut command = Command::new(program);
         command

@@ -37,21 +37,13 @@ load() {
 	echo "pingu: loaded $name for $release ($build_id)"
 }
 
-# The restriction only matters on CPUs with AVX-512 (a Steam Deck has none).
-if grep -qw avx512f /proc/cpuinfo; then
-	if load pingu_policy; then
-		if [ "$(cat /sys/module/pingu_policy/parameters/ready)" != Y ]; then
-			echo "pingu: pingu_policy is inactive (ready=N); see dmesg and reboot after fixing the cause" >&2
-			status=1
-		fi
-	fi
-else
-	echo "pingu: no AVX-512 on this CPU, pingu_policy is not needed"
-fi
-
-# Runs the whole kernel as an SVM guest, so it is only loaded when the owner opted in.
-if [ -e "$base/enable-cpuid-fault" ]; then
-	load cpuid_fault_emulation
+# One module serves the XCR0 restriction, the UMIP limits and the CPUID faulting emulation,
+# each only where the CPU needs it, so it loads on every machine.
+if load pingu_policy; then
+    if [ "$(cat /sys/module/pingu_policy/parameters/ready)" != Y ]; then
+      echo "pingu: pingu_policy is inactive (ready=N); see dmesg and reboot after fixing the cause" >&2
+      status=1
+    fi
 fi
 
 exit $status

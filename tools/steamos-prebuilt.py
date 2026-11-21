@@ -35,6 +35,12 @@ POLICY_FILES = (
     "policy.c",
     "policy.h",
     "trampoline.S",
+    "umip.c",
+    "cpuid_fault.c",
+    "svm_capture_context.S",
+    "svm_run_vm.S",
+    "inc/host_state.h",
+    "inc/vmcb_layout.h",
 )
 
 
@@ -46,14 +52,15 @@ def sha256(path: Path) -> str:
 def source_digest() -> str:
     """Identifies the module sources and the VM fixtures a build used."""
     files = [ROOT / "pingu-policy" / name for name in POLICY_FILES]
-    files += sorted(path for path in (ROOT / "cpuid-fault").rglob("*") if path.is_file() and path.suffix in (".c", ".h", ".S") or path.name == "Makefile")
     files.append(ROOT / "pingu-policy/validation/manifest.json")
     files.append(ROOT / "pingu-policy/validation/pingu-module-tool")
     files.append(Path(__file__).resolve())
     digest = hashlib.sha256()
     for path in files:
         if path.exists():
-            digest.update(str(path.relative_to(ROOT)).encode() + b"\0" + path.read_bytes())
+            digest.update(
+                str(path.relative_to(ROOT)).encode() + b"\0" + path.read_bytes()
+            )
     return digest.hexdigest()
 
 
@@ -63,7 +70,10 @@ def download(url: str, destination: Path, checksum: str) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(destination.name + ".part")
     print(f"downloading {url}", flush=True)
-    with urllib.request.urlopen(url, timeout=120) as response, partial.open("wb") as sink:
+    with (
+        urllib.request.urlopen(url, timeout=120) as response,
+        partial.open("wb") as sink,
+    ):
         shutil.copyfileobj(response, sink)
     if sha256(partial) != checksum:
         partial.unlink()
@@ -95,7 +105,9 @@ def run(command: list[str], log: Path, **options) -> None:
     with log.open("ab") as sink:
         sink.write(("$ " + " ".join(map(str, command)) + "\n").encode())
         sink.flush()
-        subprocess.run(command, stdout=sink, stderr=subprocess.STDOUT, check=True, **options)
+        subprocess.run(
+            command, stdout=sink, stderr=subprocess.STDOUT, check=True, **options
+        )
 
 
 def build_module(
@@ -129,12 +141,12 @@ def kernel_build_id(vmlinux: Path) -> str:
         header = source.read(64)
         if header[:4] != b"\x7fELF" or header[4] != 2:
             raise ValueError(f"{vmlinux} is not a 64-bit ELF file")
-        shoff, = struct.unpack_from("<Q", header, 0x28)
+        (shoff,) = struct.unpack_from("<Q", header, 0x28)
         shentsize, shnum = struct.unpack_from("<HH", header, 0x3A)
         for index in range(shnum):
             source.seek(shoff + index * shentsize)
             section = source.read(shentsize)
-            sh_type, = struct.unpack_from("<I", section, 4)
+            (sh_type,) = struct.unpack_from("<I", section, 4)
             offset, size = struct.unpack_from("<QQ", section, 0x18)
             if sh_type != 7:  # SHT_NOTE
                 continue
@@ -151,7 +163,9 @@ def kernel_build_id(vmlinux: Path) -> str:
     raise ValueError(f"{vmlinux} has no build ID")
 
 
-def build_series(repo: str, series: str, packages: dict, arguments: argparse.Namespace) -> str:
+def build_series(
+    repo: str, series: str, packages: dict, arguments: argparse.Namespace
+) -> str:
     kernel = packages[f"linux-neptune-{series}"]
     headers_package = packages[f"linux-neptune-{series}-headers"]
     if kernel["VERSION"] != headers_package["VERSION"]:
@@ -167,7 +181,9 @@ def build_series(repo: str, series: str, packages: dict, arguments: argparse.Nam
         marker = base / f".extracted-{package['NAME']}"
         if not marker.exists():
             base.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["tar", "--zstd", "-xf", str(archive), "-C", str(base)], check=True)
+            subprocess.run(
+                ["tar", "--zstd", "-xf", str(archive), "-C", str(base)], check=True
+            )
             marker.touch()
     (headers,) = base.glob("usr/lib/modules/*/build")
     release = (headers / "include/config/kernel.release").read_text().strip()
@@ -193,6 +209,7 @@ def build_series(repo: str, series: str, packages: dict, arguments: argparse.Nam
     shutil.rmtree(policy, ignore_errors=True)
     policy.mkdir()
     for name in POLICY_FILES:
+        (policy / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / "pingu-policy" / name, policy / name)
     shutil.copytree(ROOT / "pingu-policy" / "validation", policy / "validation")
     policy_module = build_module(policy, headers, llvm, arguments.jobs, log)
@@ -211,25 +228,14 @@ def build_series(repo: str, series: str, packages: dict, arguments: argparse.Nam
             log,
         )
 
-    cpuid = base / "cpuid-fault"
-    shutil.rmtree(cpuid, ignore_errors=True)
-    shutil.copytree(
-        ROOT / "cpuid-fault", cpuid, ignore=shutil.ignore_patterns("*.zip", "README.md", "dkms.conf")
-    )
-    cpuid_module = build_module(cpuid, headers, llvm, arguments.jobs, log)
-
     shutil.rmtree(destination, ignore_errors=True)
     destination.mkdir(parents=True)
     shutil.copy2(policy_module, destination / policy_module.name)
-    shutil.copy2(cpuid_module, destination / cpuid_module.name)
     receipt = policy / "validation.result.json"
     if receipt.exists():
         shutil.copy2(receipt, destination / receipt.name)
     (destination / "SHA256SUMS").write_text(
-        "".join(
-            f"{sha256(destination / name)}  {name}\n"
-            for name in (policy_module.name, cpuid_module.name)
-        )
+        f"{sha256(destination / policy_module.name)}  {policy_module.name}\n"
     )
     (destination / "source.json").write_text(
         json.dumps(
@@ -253,17 +259,38 @@ def build_series(repo: str, series: str, packages: dict, arguments: argparse.Nam
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--series", nargs="+", default=list(DEFAULT_SERIES), help="linux-neptune series, e.g. 618 72 73")
-    parser.add_argument("--repo", nargs="+", default=list(DEFAULT_REPOS), help="mirror repositories (channels); the same release string can be a different build in each")
+    parser.add_argument(
+        "--series",
+        nargs="+",
+        default=list(DEFAULT_SERIES),
+        help="linux-neptune series, e.g. 618 72 73",
+    )
+    parser.add_argument(
+        "--repo",
+        nargs="+",
+        default=list(DEFAULT_REPOS),
+        help="mirror repositories (channels); the same release string can be a different build in each",
+    )
     parser.add_argument("--out", type=Path, default=ROOT / "build" / "steamos")
     parser.add_argument("--work", type=Path, default=ROOT / ".work" / "steamos")
-    parser.add_argument("--cache", type=Path, help="package download cache (default: <work>/packages)")
+    parser.add_argument(
+        "--cache", type=Path, help="package download cache (default: <work>/packages)"
+    )
     parser.add_argument("--jobs", type=int, default=8)
-    parser.add_argument("--force", action="store_true", help="rebuild releases that are up to date")
-    parser.add_argument("--skip-vm", action="store_true", help="build without the VM gate; the result must not be shipped")
+    parser.add_argument(
+        "--force", action="store_true", help="rebuild releases that are up to date"
+    )
+    parser.add_argument(
+        "--skip-vm",
+        action="store_true",
+        help="build without the VM gate; the result must not be shipped",
+    )
     arguments = parser.parse_args()
     arguments.cache = arguments.cache or arguments.work / "packages"
-    if not (ROOT / "pingu-policy/validation/manifest.json").exists() and not arguments.skip_vm:
+    if (
+        not (ROOT / "pingu-policy/validation/manifest.json").exists()
+        and not arguments.skip_vm
+    ):
         print("run `make module-validation-assets` first", file=sys.stderr)
         return 1
     failed = 0
@@ -274,14 +301,31 @@ def main() -> int:
                 continue
             try:
                 print(build_series(repo, series, packages, arguments), flush=True)
-            except (KeyError, ValueError, OSError, subprocess.CalledProcessError) as error:
+            except (
+                KeyError,
+                ValueError,
+                OSError,
+                subprocess.CalledProcessError,
+            ) as error:
                 failed += 1
-                print(f"{repo} series {series}: FAILED ({error!r}); see {arguments.work}/{repo}/{series}-*/build.log", file=sys.stderr)
-                for log in sorted((arguments.work / repo).glob(f"{series}-*/build.log")):
+                print(
+                    f"{repo} series {series}: FAILED ({error!r}); see {arguments.work}/{repo}/{series}-*/build.log",
+                    file=sys.stderr,
+                )
+                for log in sorted(
+                    (arguments.work / repo).glob(f"{series}-*/build.log")
+                ):
                     lines = log.read_text(errors="replace").splitlines()
                     # The VM test prints every failed check once, far above the end of the log.
                     print(f"--- failed checks and errors in {log}", file=sys.stderr)
-                    print("\n".join(line for line in lines if "FAIL" in line or "error:" in line or "Error " in line)[:4000], file=sys.stderr)
+                    print(
+                        "\n".join(
+                            line
+                            for line in lines
+                            if "FAIL" in line or "error:" in line or "Error " in line
+                        )[:4000],
+                        file=sys.stderr,
+                    )
                     print(f"--- end of {log}", file=sys.stderr)
                     print("\n".join(lines[-40:]), file=sys.stderr)
     return 1 if failed else 0

@@ -1,5 +1,5 @@
-#include <linux/init.h>   /* Needed for the macros */
-#include <linux/module.h> /* Needed by all modules */
+#include <linux/init.h>
+#include <linux/module.h>
 #include <linux/printk.h> /* Needed for pr_info() */
 #include <linux/string.h> /* for memset() and memcpy() */
 #include <linux/bits.h>
@@ -18,6 +18,8 @@
 
 #include <host_state.h>
 #include <vmcb_layout.h>
+
+#include "policy.h"
 
 #define MSR_PM_BASE1  0x00000000
 #define MSR_PM_BASE2  0xc0000000
@@ -42,19 +44,17 @@
 /* V 1 bit = 0x1 (Valid) */
 /* ERRORCODE 32 bits = 0x0 */
 #define GP0_EVENTINJ (0x0D | (0x3 << 8) | (0x1 << 11) | (0x1 << 31))
+/* #DB is vector 1, a fault-class exception without error code */
+#define DB_EVENTINJ (0x01 | (0x3 << 8) | (0x1 << 31))
+#define DR6_SINGLE_STEP BIT_ULL(14)
 
 
 #ifndef page_to_phys
 #define page_to_phys(page) PFN_PHYS(page_to_pfn(page))
 #endif
 
-/* The hypervisor doesn't handle nested virtualization, so attempting to
- * virtualize a kernel currently using virtualization features will probably
- * result in an immediate crash. If you know better you can tell the module
- * to attempt the virtualization anyway */
-static int ignore_svm_enabled = 0;
-module_param(ignore_svm_enabled, int, 0);
-
+/* The hypervisor doesn't handle nested virtualization, so it only starts on a kernel
+ * that does not use SVM itself (kvm_amd loaded, for example). */
 static struct {
 	struct page* msrpm_page;
 	u64 msrpm_pa;
@@ -133,7 +133,18 @@ static bool check_svm_support(void) {
 	if (do_rdmsr(SVM_MSR_VM_CR) & BIT_ULL(VM_CR_SVMDIS_BIT))
 		return false;
 
+	/* The intercepted instructions can carry prefixes, so their length comes from the
+	 * next RIP that the CPU saves (NRIP save, CPUID 0x8000000a EDX bit 3). */
+	do_cpuid_leaf(0x8000000a, &eax, &ebx, &ecx, &edx);
+	if (!(edx & (1U << 3)))
+		return false;
+
 	return true;
+}
+
+/* Skips the intercepted instruction, whatever its encoding length. */
+static void skip_instruction(struct ProcessorStatus* status) {
+	status->vmcb.state_area.rip = status->vmcb.control_area.nrip;
 }
 
 /* capture_context saves all GPR's, as well as RIP and RFLAGS as they are at
@@ -156,7 +167,7 @@ static u64 handle_cpuid(struct ProcessorStatus* status) {
 	if(status->vmcb.state_area.cpl == 0) {
 		switch (eax) {
 		case UNLOAD_HV_MAGIC:
-			status->vmcb.state_area.rip += 2;
+			skip_instruction(status);
 			return 1; /* tell the hypervisor to devirtualize the processor */
 		}
 	} else {
@@ -171,7 +182,12 @@ static u64 handle_cpuid(struct ProcessorStatus* status) {
 	status->guest_registers.rbx = ebx;
 	status->guest_registers.rcx = ecx;
 	status->guest_registers.rdx = edx;
-	status->vmcb.state_area.rip += 2;
+	skip_instruction(status);
+	/* The emulated CPUID must also trap like the real one when the guest single-steps. */
+	if (status->vmcb.state_area.rflags & X86_EFLAGS_TF) {
+		status->vmcb.state_area.dr6 |= DR6_SINGLE_STEP;
+		status->vmcb.control_area.eventinj = DB_EVENTINJ;
+	}
 	return 0;
 }
 
@@ -231,7 +247,7 @@ static u64 handle_msr(struct ProcessorStatus* status) {
 		status->guest_registers.rax = (u32)value;
 		status->guest_registers.rdx = (u32)(value >> 32);
 	}
-	status->vmcb.state_area.rip += 2;
+	skip_instruction(status);
 	return 0;
 }
 
@@ -305,6 +321,7 @@ static void restore_host_state(struct ProcessorStatus* status) {
  * wrmsr/rdmsr to the cpuid_fault register, cpuid and runvm (required by
  * the processor)), the guest's state is saved and the hypervisor calls
  * this function */
+u64 handle_vm_exit(struct ProcessorStatus* status);
 u64 handle_vm_exit(struct ProcessorStatus* status) {
 	status->guest_registers.rsp = status->vmcb.state_area.rsp;
 	status->guest_registers.rax = status->vmcb.state_area.rax;
@@ -453,7 +470,7 @@ static int virtualize_processor(void* processor_number) {
 	int order = get_order(sizeof(struct ProcessorStatus));
 	host_status_page = alloc_pages(GFP_KERNEL, order);
 	if (!host_status_page)
-		goto host_status_page_failed;
+		return -ENOMEM;
 
 	unsigned long flags;
 	get_cpu();
@@ -492,14 +509,9 @@ static int virtualize_processor(void* processor_number) {
 
 	pr_info("Processor %d virtualized\n", (u32)(u64)processor_number);
 	return 0;
-host_status_page_failed:
-	local_irq_restore(flags);
-	put_cpu();
-
-	return -ENOMEM;
 }
 
-static int check_svm_on_cpu(void*) {
+static int check_svm_on_cpu(void *unused) {
 	return do_rdmsr(MSR_EFER) & EFER_SVME;
 }
 
@@ -585,25 +597,34 @@ static struct notifier_block pm_notifier = {
 	.notifier_call = handle_pm_notification
 };
 
-static int __init init_emulation(void) {
+int pingu_cpuid_fault_start(bool emulate) {
+	if (test_bit(X86_FEATURE_CPUID_FAULT,
+	             (unsigned long *)(boot_cpu_data.x86_capability))) {
+		pr_info("CPUID faulting is already available (native or the deprecated cpuid_fault_emulation module)\n");
+		return CPUID_FAULT_NATIVE;
+	}
+	if (!emulate) {
+		pr_info("CPUID faulting emulation is disabled\n");
+		return CPUID_FAULT_UNAVAILABLE;
+	}
 	if (!check_svm_support()) {
-		pr_info("Processor not supported\n");
-		return -ENODEV;
+		pr_info("CPUID faulting cannot be emulated: the processor has no usable SVM\n");
+		return CPUID_FAULT_UNAVAILABLE;
 	}
 	shared_data.prev_svm_enabled = check_svm_status();
 
-	if(shared_data.prev_svm_enabled && !ignore_svm_enabled) {
-		pr_info("SVM already enabled\n");
-		return -ENODEV;
+	if(shared_data.prev_svm_enabled) {
+		pr_info("CPUID faulting cannot be emulated: SVM is already in use (kvm_amd?)\n");
+		return CPUID_FAULT_UNAVAILABLE;
 	}
 
 	shared_data.msrpm_page = alloc_pages(GFP_KERNEL, 1);
 	if (!shared_data.msrpm_page)
-		goto msrpm_failed;
+		return -ENOMEM;
 	shared_data.msrpm_pa = page_to_phys(shared_data.msrpm_page);
 
 	memset(page_address(shared_data.msrpm_page), 0, 0x2000);
-	unsigned char* section_1_start = (unsigned char*)
+	unsigned char* section_1_start __maybe_unused = (unsigned char*)
 	  page_address(shared_data.msrpm_page);
 	unsigned char* section_3_start = (unsigned char*)
 	  page_address(shared_data.msrpm_page) + 0x1000;
@@ -633,13 +654,11 @@ static int __init init_emulation(void) {
 
 	register_pm_notifier(&pm_notifier);
 
-	return 0;
-
-msrpm_failed:
-	return -ENOMEM;
+	return CPUID_FAULT_EMULATED;
 }
 
-static void __exit deinit_emulation(void) {
+/* Only for a failed load: once the module is up it stays pinned. */
+void pingu_cpuid_fault_stop(void) {
 	unregister_pm_notifier(&pm_notifier);
 	if(!shared_data.prev_cpuid_fault_cap)
 		clear_bit(X86_FEATURE_CPUID_FAULT,
@@ -654,10 +673,3 @@ static void __exit deinit_emulation(void) {
 	if (shared_data.msrpm_page)
 		__free_pages(shared_data.msrpm_page, 1);
 }
-
-
-
-module_init(init_emulation);
-module_exit(deinit_emulation);
-
-MODULE_LICENSE("GPL");

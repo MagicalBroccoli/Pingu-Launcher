@@ -1,12 +1,17 @@
 # Kernel Module Design
 
+`pingu_policy` bundles three features: the exact XCR0 restriction, which this part of the
+document describes, the UMIP limit fixup and the CPUID faulting emulation (sections below).
+
 The module restores full XCR0 when entering kernel code and applies exact XCR0=7
 at the selected task's user return. Kernel FPU allocation/layout stays canonical;
 restricted user xfeatures and permissions expose x87, SSE and AVX/YMM only.
 Unrelated processes retain their normal AVX-512 state.
 
 Ten entry hooks cover syscalls, IRQs, NMIs, user debug/breakpoint exceptions,
-compat syscalls and user machine checks. Most use the kernel's synchronized
+compat syscalls and user machine checks. On a FRED boot the debug, `int $0x80` and
+machine check hooks move to their FRED entry points (see FRED And IBT below); the
+other seven are shared by both entry mechanisms. Most use the kernel's synchronized
 INT3-assisted text patcher. The breakpoint handler itself uses a checked aligned
 eight-byte store under stop_machine plus CPU synchronization, because using an
 INT3 patch there would recurse. NMI restoration is keyed by the interrupted
@@ -58,8 +63,9 @@ The actual DKMS build then boots that new kernel/module in a diskless QEMU/KVM
 guest (skipped with a warning when QEMU or KVM is missing; the test itself is
 mandatory for the SteamOS builds and for `make module-check`). It checks exec/fork/thread inheritance, exact XCR0, CPUID delivery, signals,
 XSAVE/XSAVEC, ptrace, breakpoints, migration, real 32-bit syscall entry and
-unrestricted vector/PKRU preservation. The guest boots with `ibt=off fred=off`,
-so an IBT or FRED host is tested in the configuration it must run in. Stress
+unrestricted vector/PKRU preservation. The guest runs with the CPU features that
+`-cpu host` exposes, so on a host with IBT or FRED the module is tested with them
+active. Stress
 includes 512 installation-time NMI requests, another 40 during execution and
 10,000 inherited children; tracked records must drain to zero. Timeouts/failures kill the owned test process group
 and prevent the module from being marked built.
@@ -85,7 +91,7 @@ Ubuntu, Fedora and openSUSE.
 
 Kernels before 6.6 (including 6.1 LTS) are not supported: their entry code differs
 structurally (assembly `ret_from_fork`, older kernel helper APIs), and the build
-rejects them. Also refused: a CPU reporting FRED or IBT, `CONFIG_CFI`, randomized
+rejects them. Also refused: `CONFIG_CFI`, randomized
 structure layout and kernels already carrying the built-in policy. Not covered
 by the VM suite: bare-metal Intel hosts, suspend/hotplug and long-running
 stability. A vendor kernel that rewrites its entry code can still fail the
@@ -98,17 +104,43 @@ not prove all instruction races or hardware fault paths.
 
 ## FRED And IBT
 
-The load check reads the CPU feature flags the kernel reports. `fred=off` and
-`ibt=off` clear them early in boot, and neither changes anything userspace can
-observe. User shadow stack (`user_shstk`) is a separate feature that the module
-neither checks nor touches.
+Neither needs a kernel command line change.
 
-If the flags are missing on a later boot, `pingu_policy` fails its first check and
-returns `ENODEV` before it looks up a symbol or patches kernel text. Nothing is
-patched, so the boot continues; `systemd-modules-load` logs the failed load and
-the wrapper's `arch_prctl` arming fails, so a game launch stops with
-"Cannot arm AVX-512 restriction" instead of running unrestricted. Add the flags
-to the boot entry and reboot.
+**IBT.** A kernel built with `CONFIG_X86_KERNEL_IBT` on a CPU with IBT makes the CPU
+fault (`#CP`) on an indirect branch to anything but an `ENDBR`. The module breaks that
+rule in two ways: the trampolines return into the middle of a hooked function through an
+indirect jump, and it calls kernel functions through pointers (`kallsyms_lookup_name`,
+the original lifecycle functions) whose `ENDBR` the kernel has sealed. Before it looks up
+any symbol, the module clears `ENDBR_EN` in the supervisor CET MSR (`0x6a2`) on every
+online CPU. A CPU hotplug callback repeats this on CPUs that come online later, and a
+syscore resume handler on the boot CPU after suspend or hibernation. If the load fails
+afterwards the bit is set again. `ibt_disabled` in `/sys/module/pingu_policy/parameters/`
+reads `Y` when the module switched IBT off, and the kernel stays without IBT until
+reboot. Kernels without `CONFIG_X86_KERNEL_IBT`, with `ibt=off` or on CPUs without IBT
+are not touched. The `ibt` flag in `/proc/cpuinfo` only says that the CPU supports it,
+not that the kernel enforces it.
+
+**FRED.** The module selects its hooks from the CPU feature the kernel runs with. FRED
+dispatches to the same functions as the IDT entry code for system calls, interrupts, NMIs
+and `int3`, so those seven hooks serve both. The debug, `int $0x80` and machine check
+hooks are replaced by `fred_exc_debug`, `fred_int80_emulation` and
+`fred_exc_machine_check`. The FRED debug and machine check entry points also handle
+kernel events, so they put back the XCR0 of the interrupted code after those. The planner
+only emits the FRED hooks when all three exist and can be planned; on a FRED boot without
+them `pingu_policy` returns `ENODEV` before it patches anything and logs that `fred=off`
+is needed. The `fred` parameter reads `Y` when the FRED hooks are in use.
+
+Verification: the VM suite passes on real Intel hardware (an i7-13700H, KVM guest with
+IBT, 512 NMIs while loading and 40 while running, 10,000 inherited children). The FRED
+path ran in the Bochs 3.1 emulator (CPU model `wildcat_lake`, with kernel IBT and FRED
+both active) with the same suite. There it passes except for the checks Bochs cannot
+serve (CPUID faulting, NMI injection) and two that also fail in a FRED guest without the
+module: single-stepping over `cpuid` with `ptrace` and the 32-bit ELF test. No FRED
+hardware has run it, and NMIs on the FRED path have not been exercised. KVM hosts that
+already run guests when the module loads are untested.
+
+User shadow stack (`user_shstk`) is a separate feature that the module neither checks nor
+touches.
 
 ## SteamOS
 
@@ -121,10 +153,10 @@ them.
 
 `make steamos-modules` (`tools/steamos-prebuilt.py`) downloads the current packages of
 each series from Valve's mirror, checks them against the SHA-256 in the repository
-database, builds `pingu_policy` and `cpuid_fault_emulation` with the kernel's compiler,
+database, builds `pingu_policy` with the kernel's compiler,
 strips debug information, and runs the normal VM gate on the stripped module against
 the real SteamOS boot image. Each release gets `build/steamos/releases/<release>/`
-with both modules, the validation receipt and checksums. `make launcher-dist` runs
+with the module, the validation receipt and checksums. `make launcher-dist` runs
 it first and embeds the result (the launcher build reads the directory named by
 `PINGU_STEAMOS_DIR`; a plain `make launcher` embeds none). The embedded set is
 about 150 KB per kernel build. `STEAMOS_ARGS="--series 618 --repo jupiter-beta"` selects
@@ -134,8 +166,9 @@ support, `make` and the kernel's compiler, plus QEMU/KVM for the VM gate.
 Version 0.3.0 (0.4.0 only removed the load parameters) passed the VM gate on the current `jupiter-main` kernels
 (2026-11-19, QEMU/KVM on an AMD host with the guest presenting an Intel CPU model):
 neptune 6.8.12, 6.11.11, 6.15.11, 6.16.12, 6.18.53, 7.2.15 and 7.3.1 (GCC 14 to 16,
-IBT and FRED compiled in except IBT only on 6.8, lockdown not forced).
-`cpuid_fault_emulation` builds for them but has no VM gate.
+IBT and FRED compiled in except IBT only on 6.8, lockdown not forced). The module of
+version 0.5.0 merges the former `cpuid_fault_emulation` and has not been through this
+suite on those kernels yet.
 
 On the device the launcher offers an **Install prebuilt module** button when it carries
 a module for the running kernel build (a Deck needs a password set with `passwd` first,
@@ -148,9 +181,11 @@ SteamOS copies `/var` to the other slot on every update and keeps
 rollback to the previous slot. At boot the service loads the modules in the directory
 named by `uname -r` with `insmod`, so no `depmod` index is needed, and the kernel's
 vermagic and the module's build identity check refuse a module for any other kernel.
-`pingu_policy` loads only on a CPU with AVX-512; a Steam Deck (Zen 2) has none and needs
-no restriction. `cpuid_fault_emulation` loads only after
-`sudo pingu-launcher module install-cpuid` (or its button), which also enables it at boot.
+`pingu_policy` loads on every machine, because UMIP and the CPUID faulting emulation
+may need it where the XCR0 restriction does not (a Steam Deck has no AVX-512). The
+features that a CPU does not need stay off: `cat /sys/module/pingu_policy/parameters/*`
+shows what is active. A `enable-cpuid-fault` file of the former setup is removed by the
+installation.
 
 A SteamOS update that changes the kernel release leaves the loader without modules
 (`journalctl -u pingu-modules.service` says so, and `pingu-launcher --check` reports that
@@ -160,40 +195,52 @@ reach users, and keep old builds in the set for rollbacks. Not tested on a devic
 unit and the installation, Secure Boot or lockdown (they would reject the unsigned
 module), and the Steam Machine itself.
 
+## UMIP
+
+With UMIP active the kernel emulates `SGDT` and `SIDT` for user space and stores a zero
+limit, which the programs that needed `clearcpuid=umip` do not accept. A kretprobe on
+`fixup_umip_exception()` (no kernel text is patched) decodes the memory operand of the
+64-bit instruction on entry and overwrites the stored limit after a successful
+emulation with the limits of a system without UMIP: `0x7f` for `SGDT` and `0xfff` for
+`SIDT`. It applies to every process, needs no opt-in and no IBT change, and exists only
+when the CPU feature is active; `umip_fixup` reads `Y` then, `umip_fixups` counts the
+rewrites. 32-bit code is not rewritten. The idea follows the UMIP fixup of Artitux; the
+code is written independently.
+
 ## CPUID Fault Emulation
 
-`cpuid_fault_emulation` (sources in `cpuid-fault/`, embedded into the launcher and
-written by `pingu-launcher module export-cpuid DIR`) is a separate module from
-`pingu_policy` and is independent of the XCR0 hooks. It only supplies CPUID
-faulting, which `pingu-hook` needs, on AMD CPUs that lack it.
-
-On load it checks for an AMD CPU with SVM enabled in the firmware and no SVM user
-already active, then starts a thin SVM hypervisor on every online CPU with the
-running kernel as its guest. The hypervisor intercepts CPUID and the MSR that
-holds the faulting control bit (`HWCR` or `MISC_FEATURES_ENABLES` on older
+The sources of the former `cpuid_fault_emulation` module are part of `pingu_policy` now
+(`cpuid_fault.c`, `svm_run_vm.S`, `svm_capture_context.S`, `inc/`). The feature only
+starts on an AMD CPU with SVM enabled in the firmware and NRIP save, when the kernel does
+not already have `X86_FEATURE_CPUID_FAULT` (natively, or from the deprecated module) and
+no SVM user such as `kvm_amd` is active. It then starts a thin SVM hypervisor on every
+online CPU with the running kernel as its guest. The hypervisor intercepts CPUID and the
+MSR that holds the faulting control bit (`HWCR` or `MISC_FEATURES_ENABLES` on older
 kernels), injects `#GP` for user-mode CPUID while faulting is enabled, and sets
-`X86_FEATURE_CPUID_FAULT` so the kernel exposes `arch_prctl(ARCH_SET_CPUID)`.
-Otherwise it returns `ENODEV` without changes: unsupported CPU, SVM disabled in
-the firmware, or SVM already enabled (`kvm_amd`). `ignore_svm_enabled=1` skips
-the last check and is not supported.
+`X86_FEATURE_CPUID_FAULT` so the kernel exposes `arch_prctl(ARCH_SET_CPUID)`. The
+`cpuid_fault` parameter reads `native`, `emulated` or `unavailable`; the load parameter
+`emulate_cpuid_fault=0` turns the emulation off.
 
-Differences from `pingu_policy`:
+Two defects of the standalone module were fixed on the way: the instruction length came
+from a fixed two bytes, which broke prefixed encodings such as `66 0f a2` (the CPU's
+saved next RIP is used now, which is why NRIP save is required), and a CPUID with the
+trap flag set did not trap after the emulation (the single-step `#DB` is injected now,
+which `ptrace` single-stepping needs).
 
-- It patches no kernel text and has no hooks, but runs the whole kernel as a guest,
-  so a bug is a machine crash rather than a rejected build.
-- It has no profile planning and no VM gate. DKMS builds it against the headers
-  for each new kernel, using the compiler the kernel was built with, and installs
-  it without tests, so a kernel update that builds can still misbehave.
-- It exits cleanly (`modprobe -r`), devirtualizing every CPU, and handles suspend
-  and hibernation by devirtualizing before and virtualizing after. Neither path
-  is validated here, and KVM guests cannot be started while it is loaded.
-- Autoload is configured by the owner in `/etc/modules-load.d/` and is not
-  installed by DKMS.
+Both modules together: if `cpuid_fault_emulation` is loaded first, `pingu_policy` sees
+the feature, starts nothing and reports `native`; if `pingu_policy` loads first, the old
+module refuses with "SVM already enabled". Removing the old module later takes the
+feature with it until the next reboot, so migrate by reinstalling and rebooting.
 
-To check it, load it and run `pingu-launcher --check`; the CPUID faulting entry
-must name the module. `dmesg | grep -i virtualized` shows one line per CPU. To
-disable it, remove its `modules-load.d` file, reboot or unload it, and use
-`pingu-launcher --check` to confirm what is reported afterwards.
+The hypervisor part has no hooks to reject: it patches no kernel text, but runs the
+whole kernel as a guest, so a bug is a machine crash. Suspend and hibernation devirtualize
+before and virtualize after (not validated), KVM guests cannot be started while it is
+active, and, as the rest of the module, it stays loaded until reboot.
+
+Verification: the whole VM suite, with NMI injection, passed in a KVM guest on a Ryzen
+9 7950X (nested SVM, the guest without CPUID faulting), where the emulation was active.
+The repository's VM gate itself presents an Intel CPU and so skips the emulation. Other
+AMD CPUs and bare metal are untested.
 
 ## Recovery
 

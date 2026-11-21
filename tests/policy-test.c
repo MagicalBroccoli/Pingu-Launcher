@@ -579,6 +579,60 @@ static int unrestricted_stress(int descriptor)
 }
 
 
+static bool cpu_flag_present(const char *flag)
+{
+	FILE *file = fopen("/proc/cpuinfo", "r");
+	char line[8192];
+	char wanted[32];
+	bool found = false;
+
+	snprintf(wanted, sizeof(wanted), " %s ", flag);
+	while (file && fgets(line, sizeof(line), file)) {
+		if (!strncmp(line, "flags", 5)) {
+			found = strstr(line, wanted) != NULL;
+			break;
+		}
+	}
+	if (file)
+		fclose(file);
+	return found;
+}
+
+struct __attribute__((packed)) descriptor_table {
+	uint16_t limit;
+	uint64_t base;
+};
+
+static char umip_buffer[32];
+
+/* With UMIP active the kernel emulates SGDT/SIDT; the module has to leave the real limits behind. */
+static bool umip_limits_test(void)
+{
+	struct descriptor_table local;
+	struct descriptor_table *pointer = (struct descriptor_table *)(umip_buffer + 2);
+	unsigned long index = 1;
+	bool success = true;
+
+	if (!cpu_flag_present("umip")) {
+		puts("SKIP: UMIP is not active");
+		return true;
+	}
+	memset(umip_buffer, 0xaa, sizeof(umip_buffer));
+	__asm__ volatile("sgdt %0" : "=m"(local));
+	success &= local.limit == 0x7f;
+	__asm__ volatile("sidt %0" : "=m"(local));
+	success &= local.limit == 0xfff;
+	__asm__ volatile("sgdt %0" : "=m"(umip_buffer));
+	success &= *(uint16_t *)umip_buffer == 0x7f;
+	__asm__ volatile("sidt (%0)" : : "r"(pointer) : "memory");
+	success &= pointer->limit == 0xfff;
+	__asm__ volatile("sgdt 4(%0,%1,4)" : : "r"(umip_buffer), "r"(index) : "memory");
+	success &= *(uint16_t *)(umip_buffer + 8) == 0x7f;
+	__asm__ volatile("sidt -2(%0)" : : "r"(umip_buffer + 16) : "memory");
+	success &= *(uint16_t *)(umip_buffer + 14) == 0xfff;
+	return success;
+}
+
 static int module_probe_tests(void)
 {
 	uint64_t original_xcr0 = read_xcr(0);
@@ -603,6 +657,7 @@ static int module_probe_tests(void)
 		check("load VM entry hook", result == 0);
 		if (result)
 			break;
+		check("SGDT and SIDT report real limits", umip_limits_test());
 		check("unrestricted instructions with entry hook", child_succeeded(start_program(
 			(char *const[]){ "/xstate-probe", "--expect=avx512", NULL })));
 		if (pipe2(descriptors, O_CLOEXEC | O_NONBLOCK) < 0) {

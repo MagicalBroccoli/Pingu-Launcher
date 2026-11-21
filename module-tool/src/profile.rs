@@ -17,13 +17,19 @@ use crate::decode::{self, Decoder, Instruction, Operand};
 use crate::image::{Res, extract_kernel_elf};
 
 pub const SCHEMA: u64 = 2;
-const SOURCE_FILES: [&str; 6] = [
+const SOURCE_FILES: [&str; 12] = [
     "Makefile",
     "dkms.conf",
     "probe.c",
     "policy.c",
     "policy.h",
     "trampoline.S",
+    "umip.c",
+    "cpuid_fault.c",
+    "svm_capture_context.S",
+    "svm_run_vm.S",
+    "inc/host_state.h",
+    "inc/vmcb_layout.h",
 ];
 const ENDBR: [u8; 4] = [0xf3, 0x0f, 0x1e, 0xfa];
 pub const MAX_WINDOW: usize = 16;
@@ -54,6 +60,13 @@ const HOOKS: [(&str, &[&str], bool); 10] = [
         &["noist_exc_machine_check"],
         false,
     ),
+];
+/// FRED entry points that replace the IDT-only debug, int 0x80 and machine check hooks.
+/// They follow HOOKS in the tables; kernels without FRED code get empty slots.
+const FRED_HOOKS: [(&str, &str, bool); 3] = [
+    ("fred_exc_debug", "fred_exc_debug", false),
+    ("fred_int80_emulation", "fred_int80_emulation", false),
+    ("fred_exc_machine_check", "fred_exc_machine_check", false),
 ];
 const FIXED_SYMBOLS: [&str; 9] = [
     "kallsyms_lookup_name",
@@ -744,6 +757,10 @@ pub fn plan_window(
 pub struct Features {
     pub lass: bool,
     pub task_fpu: bool,
+    /// Kernels from 7.x register a `struct syscore` instead of `struct syscore_ops`.
+    pub syscore_struct: bool,
+    /// The kernel has FRED entry code and every FRED hook could be planned.
+    pub fred: bool,
     pub text_poke_single: String,
     pub text_poke_sync: String,
     pub text_poke_atomic: String,
@@ -896,9 +913,19 @@ pub fn detect_features(headers: &Path, symbols: &Symbols, extra: &[PathBuf]) -> 
             break;
         }
     }
+    let syscore_struct = match roots
+        .iter()
+        .map(|root| root.join("include/linux/syscore_ops.h"))
+        .find(|path| path.is_file())
+    {
+        Some(path) => read_text(&path)?.contains("struct syscore {"),
+        None => false,
+    };
     Ok(Features {
         lass,
         task_fpu,
+        syscore_struct,
+        fred: false,
         text_poke_single: single.unwrap().to_string(),
         text_poke_sync: sync.unwrap().to_string(),
         text_poke_atomic: atomic.unwrap().to_string(),
@@ -1031,7 +1058,7 @@ pub fn inspect_kernel(inputs: &Inputs) -> Res<Profile> {
         .map(Path::to_path_buf)
         .into_iter()
         .collect();
-    let features = detect_features(headers, symbols, &extra)?;
+    let mut features = detect_features(headers, symbols, &extra)?;
     let build_id = match info.build_ids.iter().collect::<Vec<_>>().as_slice() {
         [id] if id.len() == 40 && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) => {
             (*id).clone()
@@ -1052,26 +1079,38 @@ pub fn inspect_kernel(inputs: &Inputs) -> Res<Profile> {
             ));
         };
         let window = plan_window(&kernel, symbols, &mut interner, name, atomic)?;
-        entries.push(Entry {
-            role: role.to_string(),
-            name: name.to_string(),
-            address: format!("{:#x}", symbols.address(name)? + window.skip),
-            skip: window.skip,
-            bytes: hex(&window.data),
-            instructions: window.instructions,
-            assembly: window.assembly,
-            relocations: window
-                .relocs
-                .into_iter()
-                .map(|(disp, end, symbol, addend)| RelocationEntry {
-                    disp,
-                    end,
-                    symbol,
-                    addend,
-                })
-                .collect(),
-        });
+        entries.push(hook_entry(role, name, symbols.address(name)?, window));
     }
+    // FRED support is all or nothing; a kernel without it simply keeps the IDT hooks.
+    let known_targets = interner.targets.len();
+    let mut fred_entries = Vec::new();
+    let mut fred_problem = None;
+    for (role, name, atomic) in FRED_HOOKS {
+        if !symbols.defined(name) {
+            fred_problem = Some(format!("{name} is missing"));
+            break;
+        }
+        match plan_window(&kernel, symbols, &mut interner, name, atomic) {
+            Ok(window) => fred_entries.push(hook_entry(role, name, symbols.address(name)?, window)),
+            Err(error) => {
+                fred_problem = Some(error);
+                break;
+            }
+        }
+    }
+    if let Some(problem) = fred_problem {
+        if symbols.defined("fred_entry_from_user") {
+            eprintln!("warning: FRED entry points are not usable by the module: {problem}");
+        }
+        interner.targets.truncate(known_targets);
+        fred_entries = FRED_HOOKS
+            .iter()
+            .map(|(role, _, _)| absent_entry(role))
+            .collect();
+    } else {
+        features.fred = true;
+    }
+    entries.extend(fred_entries);
     Ok(Profile {
         schema: SCHEMA,
         release,
@@ -1089,6 +1128,42 @@ pub fn inspect_kernel(inputs: &Inputs) -> Res<Profile> {
         profile_sha256: None,
         vm_validated: None,
     })
+}
+
+fn hook_entry(role: &str, name: &str, address: u64, window: Window) -> Entry {
+    Entry {
+        role: role.to_string(),
+        name: name.to_string(),
+        address: format!("{:#x}", address + window.skip),
+        skip: window.skip,
+        bytes: hex(&window.data),
+        instructions: window.instructions,
+        assembly: window.assembly,
+        relocations: window
+            .relocs
+            .into_iter()
+            .map(|(disp, end, symbol, addend)| RelocationEntry {
+                disp,
+                end,
+                symbol,
+                addend,
+            })
+            .collect(),
+    }
+}
+
+/// An unused slot keeps the tables aligned with the hook numbering.
+fn absent_entry(role: &str) -> Entry {
+    Entry {
+        role: role.to_string(),
+        name: String::new(),
+        address: "0x0".to_string(),
+        skip: 0,
+        bytes: String::new(),
+        instructions: Vec::new(),
+        assembly: Vec::new(),
+        relocations: Vec::new(),
+    }
 }
 
 fn c_string(value: &str) -> String {
@@ -1123,7 +1198,7 @@ pub fn header_text(profile: &Profile) -> String {
                 .map(|value| format!("0x{value:02x}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("\t{{ {bytes} }}")
+            format!("\t{{ {} }}", if bytes.is_empty() { "0" } else { &bytes })
         })
         .collect::<Vec<_>>()
         .join(",\n");
@@ -1202,6 +1277,8 @@ pub fn header_text(profile: &Profile) -> String {
          #define XCR0_PROFILE_VALIDATED_TEXT \"{validated}\"\n\
          #define XCR0_HAVE_LASS {lass}\n\
          #define XCR0_HAVE_TASK_FPU {task_fpu}\n\
+         #define XCR0_PROFILE_FRED {fred}\n\
+         #define XCR0_HAVE_SYSCORE_STRUCT {syscore_struct}\n\
          #define XCR0_SYM_TEXT_POKE_SINGLE {single}\n\
          #define XCR0_SYM_TEXT_POKE_SYNC {sync}\n\
          #define XCR0_SYM_TEXT_POKE_ATOMIC {atomic}\n\
@@ -1224,6 +1301,8 @@ pub fn header_text(profile: &Profile) -> String {
         id = c_string(&profile.build_id),
         lass = i32::from(features.lass),
         task_fpu = i32::from(features.task_fpu),
+        fred = i32::from(features.fred),
+        syscore_struct = i32::from(features.syscore_struct),
         single = c_string(&features.text_poke_single),
         sync = c_string(&features.text_poke_sync),
         atomic = c_string(&features.text_poke_atomic),
@@ -1738,6 +1817,8 @@ mod tests {
             features: Features {
                 lass: false,
                 task_fpu: true,
+                syscore_struct: false,
+                fred: false,
                 text_poke_single: "text_poke_bp".into(),
                 text_poke_sync: "text_poke_sync".into(),
                 text_poke_atomic: "text_poke".into(),
@@ -1803,6 +1884,27 @@ mod tests {
         assert!(header.contains("#define XCR0_SYM_TEXT_POKE_SINGLE \"text_poke_bp\""));
         assert!(header.contains("#define XCR0_TEXT_POKE_ATOMIC_CUSTOM 0"));
         assert!(header.contains("#ifndef XCR0_PROFILE_FEATURES_ONLY"));
+    }
+
+    #[test]
+    fn missing_fred_hooks_leave_empty_slots() {
+        let mut profile = sample();
+        profile.entries.push(absent_entry("fred_exc_debug"));
+        let header = header_text(&profile);
+        assert!(header.contains("#define XCR0_PROFILE_FRED 0"));
+        assert!(header.contains("#define XCR0_PROLOGUE_FRED_EXC_DEBUG \n"));
+        assert!(header.contains("xcr0_profile_lengths[] = { 7, 7, 0 }"));
+        assert!(header.contains(
+            "xcr0_profile_names[] = { \"irqentry_enter\", \"irqentry_nmi_enter\", \"\" }"
+        ));
+        assert!(header.contains("\t{ 0 }\n"));
+    }
+
+    #[test]
+    fn usable_fred_hooks_are_flagged() {
+        let mut profile = sample();
+        profile.features.fred = true;
+        assert!(header_text(&profile).contains("#define XCR0_PROFILE_FRED 1"));
     }
 
     #[test]

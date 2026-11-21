@@ -94,3 +94,30 @@ SYM_CODE_START(xcr0_probe_original_mce)
 	jmp *xcr0_probe_continuations+72(%rip)
 	int3
 SYM_CODE_END(xcr0_probe_original_mce)
+
+SYM_CODE_START(xcr0_probe_original_fred_debug)
+	UNWIND_HINT_FUNC
+	ENDBR
+	XCR0_PROLOGUE_FRED_EXC_DEBUG
+	ANNOTATE_RETPOLINE_SAFE
+	jmp *xcr0_probe_continuations+80(%rip)
+	int3
+SYM_CODE_END(xcr0_probe_original_fred_debug)
+
+SYM_CODE_START(xcr0_probe_original_fred_int80)
+	UNWIND_HINT_FUNC
+	ENDBR
+	XCR0_PROLOGUE_FRED_INT80_EMULATION
+	ANNOTATE_RETPOLINE_SAFE
+	jmp *xcr0_probe_continuations+88(%rip)
+	int3
+SYM_CODE_END(xcr0_probe_original_fred_int80)
+
+SYM_CODE_START(xcr0_probe_original_fred_mce)
+	UNWIND_HINT_FUNC
+	ENDBR
+	XCR0_PROLOGUE_FRED_EXC_MACHINE_CHECK
+	ANNOTATE_RETPOLINE_SAFE
+	jmp *xcr0_probe_continuations+96(%rip)
+	int3
+SYM_CODE_END(xcr0_probe_original_fred_mce)

@@ -1,7 +1,8 @@
 obj-m += pingu_policy.o
-pingu_policy-y := probe.o policy.o trampoline.o
+pingu_policy-y := probe.o policy.o trampoline.o umip.o cpuid_fault.o svm_capture_context.o svm_run_vm.o
 CFLAGS_policy.o += -fno-optimize-sibling-calls
-ccflags-y += -I$(obj)
+ccflags-y += -I$(obj) -I$(src)/inc
+asflags-y += -I$(src)/inc
 
 XCR0_HEADERS ?= $(srctree)
 # A static helper that plans the patches and runs the VM gate; `make` puts it in validation/.

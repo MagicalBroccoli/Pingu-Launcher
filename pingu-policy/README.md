@@ -1,16 +1,29 @@
 # pingu-policy Module
 
-Version 0.4.0; module `pingu_policy`, DKMS package `pingu-policy`.
+Version 0.5.0; module `pingu_policy`, DKMS package `pingu-policy`.
 
 See the installation guide in `../docs/cli.md` and the kernel design and
 recovery notes in `../docs/kernel-module.md`. Those paths refer to the source
 repository; the package that `pingu-launcher module export` writes includes this
 module README as a self-contained summary.
 
-The module sets real userspace XCR0 to exactly 7 for tasks that arm private
-`arch_prctl(0x6001, 3)` before exec. `arch_prctl(0x6002, 0)` returns 0 off, 3 pending
-or 4 active. Active policy survives fork, threads and exec and cannot be dropped.
-CPUID is left untouched for `pingu-hook`.
+The module does three jobs, each only where the machine needs it:
+
+- **XCR0:** real userspace XCR0 is exactly 7 for tasks that arm private
+  `arch_prctl(0x6001, 3)` before exec (skipped when the kernel already runs with XCR0 7).
+  `arch_prctl(0x6002, 0)` returns 0 off, 3 pending or 4 active. Active policy survives
+  fork, threads and exec and cannot be dropped. CPUID is left untouched for
+  `pingu-hook`.
+- **UMIP:** with UMIP active, `SGDT` and `SIDT` report `0x7f` and `0xfff` instead of the
+  zero limit of the kernel's emulation, so `clearcpuid=umip` is not needed.
+- **CPUID faulting:** on an AMD CPU with SVM that cannot fault CPUID, a thin hypervisor
+  provides it (the former `cpuid_fault_emulation` module). It does nothing when the
+  feature exists, whoever provides it, or when SVM is in use (`kvm_amd`).
+
+Read-only parameters under `/sys/module/pingu_policy/parameters/`: `ready`,
+`xcr0_policy`, `umip_fixup`, `cpuid_fault` (`native`, `emulated`, `unavailable`), `fred`,
+`ibt_disabled`. The only load parameter, `emulate_cpuid_fault` (default `Y`), turns the
+hypervisor off.
 
 The build requires, for the kernel it targets: its header package, the compiler
 that built that kernel (GCC or Clang; the build picks it from the kernel
@@ -55,7 +68,7 @@ cat /sys/module/pingu_policy/parameters/ready
 
 Installation/loading commands require administrator privileges. Readiness must
 be `Y`; `N` means the module is inactive and a reboot is required before retrying.
-The module takes no parameters. The included `modules-load.d` file can be installed
+The included `modules-load.d` file can be installed
 by the owner after native validation to enable future boot loading; builds do not
 write it. Version 0.3.0 needed `experiment=1 allow_host=1` in a `modprobe.d` file,
 which must be removed because `modprobe` refuses the module with those options. Secure Boot requires normal trusted-key module signing.
@@ -65,10 +78,13 @@ configuration and reboot to disable it or before replacing a loaded module.
 Do not overwrite source of an installed version with different code.
 
 This is experimental runtime kernel patching, not standard livepatch and not a
-security boundary. Unsupported kernel instructions/configuration, FRED and IBT
-are rejected. On a CPU that reports FRED or IBT, boot with `fred=off ibt=off`;
-without them the module returns `ENODEV` before reading symbols or patching
-anything, so the boot is unaffected and the module simply stays unloaded. The VM
-gate boots its guest with the same flags. A VM pass does not prove hardware error recovery, suspend/hotplug,
-performance, or protected-game compatibility. Preserve the exact-XCR0-compatible
-userspace runtime and the game's existing settings.
+security boundary. Unsupported kernel instructions/configuration are rejected.
+FRED needs no boot parameter: on a FRED boot the module hooks the FRED entry points.
+Kernel IBT is switched off for as long as the module is loaded (`ibt_disabled` reads
+`Y` in `/sys/module/pingu_policy/parameters/`), because the hook trampolines are not
+valid indirect branch targets. If a FRED kernel's entry points cannot be hooked, the
+module returns `ENODEV` before reading symbols or patching anything, so the boot is
+unaffected and the module simply stays unloaded; boot with `fred=off` then. The VM
+gate boots its guest with the features of the build host. A VM pass does not prove
+hardware error recovery, suspend/hotplug, performance, or protected-game compatibility.
+Preserve the exact-XCR0-compatible userspace runtime and the game's existing settings.
