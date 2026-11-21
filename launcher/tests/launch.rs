@@ -199,6 +199,7 @@ fn steam_commands_replace_proton_in_place() {
             "--verb=run",
             "--",
             companion.join("proton").to_str().unwrap(),
+            companion.join("original-proton").to_str().unwrap(),
             companion.join("original/proton").to_str().unwrap(),
             "run",
             "game.exe",

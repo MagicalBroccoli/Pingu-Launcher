@@ -38,6 +38,10 @@ const OVERLAYS: [&str; 6] = [
     "usr/share/libdrm",
 ];
 
+/// Runs the original Proton so that its prefix files name the original directory.
+const RUNNER: &str = "original-proton";
+const RUNNER_SOURCE: &str = include_str!("original_proton.py");
+
 pub type Environment = Vec<(String, String)>;
 
 /// What to execute: the namespace wrapper around the command, and its environment.
@@ -137,6 +141,7 @@ pub fn prepare_tool(original: &Path, launcher: &Path, cache: &Path) -> Result<Pa
         .join("proton")
         .to_string_lossy()
         .into_owned();
+    command.insert(0, companion.join(RUNNER).to_string_lossy().into_owned());
     manifest.set_text("commandline", format!("/proton {}", shlex::join(&command)));
     manifest.set_text("avx2_policy_companion", "1");
     document.insert("manifest", Node::Map(manifest));
@@ -178,7 +183,7 @@ pub fn prepare_tool(original: &Path, launcher: &Path, cache: &Path) -> Result<Pa
         } else {
             symlink(&source, &view).map_err(at(&view))?;
         }
-        if name == "proton" || name == "toolmanifest.vdf" {
+        if name == "proton" || name == "toolmanifest.vdf" || name == RUNNER {
             continue;
         }
 
@@ -204,7 +209,11 @@ pub fn prepare_tool(original: &Path, launcher: &Path, cache: &Path) -> Result<Pa
     fs::set_permissions(&proton, fs::Permissions::from_mode(0o755)).map_err(at(&proton))?;
     let staged_manifest = staging.path().join("toolmanifest.vdf");
     fs::write(&staged_manifest, vdf::dump(&document)).map_err(at(&staged_manifest))?;
-    for file in ["proton", "toolmanifest.vdf"] {
+    let runner = staging.path().join(RUNNER);
+    let shown = serde_json::to_string(&original_text).map_err(|error| error.to_string())?;
+    fs::write(&runner, RUNNER_SOURCE.replace("\"__ORIGINAL__\"", &shown)).map_err(at(&runner))?;
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o755)).map_err(at(&runner))?;
+    for file in ["proton", "toolmanifest.vdf", RUNNER] {
         fs::rename(staging.path().join(file), companion.join(file))
             .map_err(at(&companion.join(file)))?;
     }
@@ -482,6 +491,7 @@ pub fn steam_proton(command: &[String]) -> Result<(PathBuf, usize), String> {
 pub fn steam_command(command: &[String], companion: &Path, index: usize) -> Vec<String> {
     let mut result = command[..index].to_vec();
     result.push(companion.join("proton").to_string_lossy().into_owned());
+    result.push(companion.join(RUNNER).to_string_lossy().into_owned());
     result.push(
         companion
             .join("original/proton")
@@ -732,9 +742,25 @@ mod tests {
         assert_eq!(
             command,
             [
+                companion.join(RUNNER).to_string_lossy(),
                 companion.join("original/proton").to_string_lossy(),
                 "%verb%".into()
             ]
+        );
+    }
+
+    #[test]
+    fn the_runner_names_the_original_directory() {
+        let fixture = Fixture::new("wrapper-runner");
+        let companion = fixture.prepare();
+        let runner = fs::read_to_string(companion.join(RUNNER)).unwrap();
+        let original = fs::canonicalize(&fixture.original).unwrap();
+        assert!(runner.starts_with("#!/usr/bin/env python3\n"));
+        assert!(runner.contains(&format!("ORIGINAL = {:?}\n", original.to_str().unwrap())));
+        assert!(!runner.contains("__ORIGINAL__"));
+        assert_eq!(
+            fs::metadata(companion.join(RUNNER)).unwrap().permissions().mode() & 0o777,
+            0o755
         );
     }
 
@@ -1086,11 +1112,12 @@ mod tests {
         let rewritten = steam_command(&command, &companion, index);
         assert_eq!(rewritten[..index], command[..index]);
         assert_eq!(rewritten[index], companion.join("proton").to_string_lossy());
+        assert_eq!(rewritten[index + 1], companion.join(RUNNER).to_string_lossy());
         assert_eq!(
-            rewritten[index + 1],
+            rewritten[index + 2],
             companion.join("original/proton").to_string_lossy()
         );
-        assert_eq!(rewritten[index + 2..], command[index + 1..]);
+        assert_eq!(rewritten[index + 3..], command[index + 1..]);
     }
 
     #[test]
