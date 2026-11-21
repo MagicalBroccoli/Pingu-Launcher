@@ -308,7 +308,7 @@ def main() -> int:
     parser.add_argument(
         "--skip-vm",
         action="store_true",
-        help="build without the VM gate; the result must not be shipped",
+        help="build without the VM gate (CI does; `make steamos-modules` validates before a release)",
     )
     arguments = parser.parse_args()
     arguments.cache = arguments.cache or arguments.work / "packages"

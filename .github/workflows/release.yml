@@ -49,29 +49,22 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config clang lld podman python3 zstd curl
 
-      # The SteamOS modules are tested in a VM, which needs KVM.
-      - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
 
       # Valve builds its kernels on Arch Linux (a new GCC, pahole and objtool libraries that
-      # Ubuntu lacks), so the module is built and tested in an Arch container with KVM.
-      - name: Build and test the SteamOS module
+      # Ubuntu lacks), so the module is built in an Arch container. The VM gate needs a host
+      # with AVX-512, which hosted runners do not always have, so `cz bump` runs it (.cz.toml).
+      - name: Build the SteamOS module
         env:
           REPO: ${{ matrix.repo }}
           SERIES: ${{ matrix.series }}
         run: |
           make bootstrap pingu-policy/validation/manifest.json
-          podman run --rm --device /dev/kvm -e REPO -e SERIES -v "$PWD:/src" -w /src docker.io/archlinux/archlinux:base-devel \
-            sh -ec 'pacman -Syu --noconfirm --needed python pahole libelf bc zstd qemu-system-x86 >/dev/null
-                    python3 tools/steamos-prebuilt.py --jobs "$(nproc)" --repo "$REPO" --series "$SERIES"'
+          podman run --rm -e REPO -e SERIES -v "$PWD:/src" -w /src docker.io/archlinux/archlinux:base-devel \
+            sh -ec 'pacman -Syu --noconfirm --needed python pahole libelf bc zstd >/dev/null
+                    python3 tools/steamos-prebuilt.py --skip-vm --jobs "$(nproc)" --repo "$REPO" --series "$SERIES"'
 
       - name: Keep the module build logs
         if: failure()
@@ -133,7 +126,7 @@ jobs:
             exit 1
           fi
 
-      # The modules are built and tested by the steamos-module jobs, so this only embeds them.
+      # The steamos-module jobs built the modules, so this only embeds them.
       # The launcher is built in a Debian 11 container, so it runs on glibc 2.31 or newer.
       - name: Build the portable launcher
         run: |

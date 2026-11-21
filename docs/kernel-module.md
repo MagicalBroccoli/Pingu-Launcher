@@ -158,7 +158,10 @@ strips debug information, and runs the normal VM gate on the stripped module aga
 the real SteamOS boot image. Each release gets `build/steamos/releases/<release>/`
 with the module, the validation receipt and checksums. `make launcher-dist` runs
 it first and embeds the result (the launcher build reads the directory named by
-`PINGU_STEAMOS_DIR`; a plain `make launcher` embeds none). The embedded set is
+`PINGU_STEAMOS_DIR`; a plain `make launcher` embeds none). The VM gate needs a host with
+AVX-512, which hosted CI runners do not always have, so the release workflow builds each
+kernel in its own job with `--skip-vm` and `cz bump` runs `make steamos-modules` on the
+maintainer's machine first. The embedded set is
 about 150 KB per kernel build. `STEAMOS_ARGS="--series 618 --repo jupiter-3.10"` selects
 series and channel (`jupiter-3.9` is stable, `jupiter-3.10` beta, `jupiter-main` the development channel; all three are built by default). The script needs only Python's standard library, `tar` with zstd
 support, `make` and the kernel's compiler, plus QEMU/KVM for the VM gate.
