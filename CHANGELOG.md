@@ -1,0 +1,13 @@
+## v0.3.0 (2026-11-21)
+
+### Feat
+
+- **launcher**: Faugus Launcher games keep their mangohud and gamemoderun prefix
+- **launcher**: guide users off the old cpuid_fault_emulation module and kernel command line changes
+- **pingu-policy**: one module now covers UMIP and CPUID faulting and works on IBT and FRED kernels
+
+## v0.2.0 (2026-11-20)
+
+### Feat
+
+- initial public release
