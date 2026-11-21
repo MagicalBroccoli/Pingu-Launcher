@@ -211,15 +211,31 @@ code is written independently.
 
 The sources of the former `cpuid_fault_emulation` module are part of `pingu_policy` now
 (`cpuid_fault.c`, `svm_run_vm.S`, `svm_capture_context.S`, `inc/`). The feature only
-starts on an AMD CPU with SVM enabled in the firmware and NRIP save, when the kernel does
-not already have `X86_FEATURE_CPUID_FAULT` (natively, or from the deprecated module) and
-no SVM user such as `kvm_amd` is active. It then starts a thin SVM hypervisor on every
-online CPU with the running kernel as its guest. The hypervisor intercepts CPUID and the
+is offered on an AMD CPU with SVM enabled in the firmware and NRIP save, when the kernel does
+not already have `X86_FEATURE_CPUID_FAULT` (natively, or from the deprecated module).
+Loading the module starts nothing (`cpuid_fault` reads `on_demand`). The thin SVM
+hypervisor, with the running kernel as its guest on every online CPU, starts inside
+`arch_prctl(ARCH_SET_CPUID, 0)`, which the module hooks together with the other
+`arch_prctl` entry points (also on kernels that need no XCR0 policy), and only while no
+other SVM user is active: otherwise the call fails with `ENODEV` and `cpuid_fault` reads
+`busy`. `arch_prctl(ARCH_SET_CPUID, 1)` reports success without starting it, because
+enabling CPUID needs no hypervisor. The hypervisor intercepts CPUID and the
 MSR that holds the faulting control bit (`HWCR` or `MISC_FEATURES_ENABLES` on older
 kernels), injects `#GP` for user-mode CPUID while faulting is enabled, and sets
-`X86_FEATURE_CPUID_FAULT` so the kernel exposes `arch_prctl(ARCH_SET_CPUID)`. The
-`cpuid_fault` parameter reads `native`, `emulated` or `unavailable`; the load parameter
-`emulate_cpuid_fault=0` turns the emulation off.
+`X86_FEATURE_CPUID_FAULT` so the kernel exposes `arch_prctl(ARCH_SET_CPUID)`.
+Every three seconds a work item looks for a thread with `TIF_NOCPUID` set; after two
+scans without one, and with no `ARCH_SET_CPUID` call under way, it devirtualizes all CPUs
+and clears the feature bit again, so KVM can claim SVM. CPUs that go offline or come
+online while it runs are devirtualized and virtualized by a hotplug callback. The
+`cpuid_fault` parameter reads `native`, `emulated` (running), `on_demand`, `busy` or
+`unavailable`; the load parameter `emulate_cpuid_fault=0` turns the emulation off.
+
+KVM has to leave SVM alone while no virtual machine exists: since Linux 6.16 it claims
+SVM at load unless `kvm.enable_virt_at_load=0`, which the launcher's install writes to
+`/etc/modprobe.d/pingu-kvm-lazy.conf` on such CPUs. Starting a virtual machine while the
+hypervisor runs fails cleanly (`KVM_CREATE_VM` returns `EIO`, the kernel log says
+`kvm: enabling virtualization on CPU0 failed`), and loading the hypervisor while a virtual
+machine runs is refused (`busy`); neither crashes.
 
 Two defects of the standalone module were fixed on the way: the instruction length came
 from a fixed two bytes, which broke prefixed encodings such as `66 0f a2` (the CPU's
@@ -233,14 +249,18 @@ module refuses with "SVM already enabled". Removing the old module later takes t
 feature with it until the next reboot, so migrate by reinstalling and rebooting.
 
 The hypervisor part has no hooks to reject: it patches no kernel text, but runs the
-whole kernel as a guest, so a bug is a machine crash. Suspend and hibernation devirtualize
-before and virtualize after (not validated), KVM guests cannot be started while it is
-active, and, as the rest of the module, it stays loaded until reboot.
+whole kernel as a guest while it is on, so a bug is a machine crash. Suspend and
+hibernation devirtualize before and virtualize after (not validated), KVM virtual machines
+cannot be started while it runs, and the module itself stays loaded until reboot.
 
 Verification: the whole VM suite, with NMI injection, passed in a KVM guest on a Ryzen
-9 7950X (nested SVM, the guest without CPUID faulting), where the emulation was active.
-The repository's VM gate itself presents an Intel CPU and so skips the emulation. Other
-AMD CPUs and bare metal are untested.
+9 7950X (nested SVM, the guest without CPUID faulting), where the emulation was active
+(before it became on demand). The on-demand lifecycle was exercised in a nested Bazzite
+guest on the same host (KVM paravirtualization hidden from the guest: the hypervisor
+cannot forward the `VMMCALL` of paravirtualized KVM guests): repeated start and stop, the
+self test, a KVM virtual machine while idle and while running, and a CPU taken offline
+and online while it ran. The repository's VM gate itself presents an Intel CPU and so
+skips the emulation. Other AMD CPUs and bare metal are untested.
 
 ## Recovery
 

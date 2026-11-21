@@ -17,11 +17,14 @@ The module does three jobs, each only where the machine needs it:
 - **UMIP:** with UMIP active, `SGDT` and `SIDT` report `0x7f` and `0xfff` instead of the
   zero limit of the kernel's emulation, so `clearcpuid=umip` is not needed.
 - **CPUID faulting:** on an AMD CPU with SVM that cannot fault CPUID, a thin hypervisor
-  provides it (the former `cpuid_fault_emulation` module). It does nothing when the
-  feature exists, whoever provides it, or when SVM is in use (`kvm_amd`).
+  provides it (the former `cpuid_fault_emulation` module), started when a process asks for
+  CPUID faulting and stopped when none does, so KVM can use SVM in between (kvm needs
+  `enable_virt_at_load=0`, which the launcher's install writes to modprobe.d). It does
+  nothing when the feature exists, whoever provides it.
 
 Read-only parameters under `/sys/module/pingu_policy/parameters/`: `ready`,
-`xcr0_policy`, `umip_fixup`, `cpuid_fault` (`native`, `emulated`, `unavailable`), `fred`,
+`xcr0_policy`, `umip_fixup`, `cpuid_fault` (`native`, `emulated` while the hypervisor
+runs, `on_demand`, `busy` while SVM is in use, `unavailable`), `fred`,
 `ibt_disabled`. The only load parameter, `emulate_cpuid_fault` (default `Y`), turns the
 hypervisor off.
 

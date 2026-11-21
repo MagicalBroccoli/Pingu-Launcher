@@ -115,16 +115,25 @@ sudo install -Dm644 /usr/src/pingu-policy-0.5.0/modules-load.d/pingu-policy.conf
 
 See [kernel-module.md](kernel-module.md) for recovery and validation limits. What each
 feature did is readable under `/sys/module/pingu_policy/parameters/`: `xcr0_policy`,
-`umip_fixup` and `cpuid_fault` (`native`, `emulated` or `unavailable`).
+`umip_fixup` and `cpuid_fault` (`native`, `emulated`, `on_demand`, `busy` or `unavailable`).
 
 ## CPUID Faulting And UMIP
 
 Both are handled by `pingu_policy` now; nothing needs a separate module or a boot
 parameter. On an AMD CPU with SVM (AMD-V) enabled in the firmware that cannot fault
-CPUID, loading the module starts a minimal hypervisor under the kernel, so it cannot
-start while `kvm_amd` or another SVM user is active (`cpuid_fault` then reads
-`unavailable`, and `--check` says so). Save work and keep a recovery kernel before the
-first load on such a CPU. Other CPUs are not virtualized.
+CPUID, the module provides it with a minimal hypervisor under the kernel, started on
+demand: loading the module only makes it ready (`cpuid_fault` reads `on_demand`), the
+hypervisor starts when a process asks for CPUID faulting (a game under `pingu-hook`) and
+stops a few seconds after the last such process ended (`emulated` while it runs). KVM
+cannot use SVM while it runs. `module install` therefore writes
+`/etc/modprobe.d/pingu-kvm-lazy.conf` (`options kvm enable_virt_at_load=0`) on such a
+CPU, which makes kvm claim SVM only while a virtual machine exists, and reloads
+`kvm_amd` right away when no virtual machine runs (`module uninstall` removes the file).
+With it, virtual machines work whenever no game is running. While one runs, a virtual
+machine fails to start, and while a virtual machine runs `cpuid_fault` reads `busy`:
+`--check` fails the CPUID faulting check and the launcher refuses to start the game
+until the virtual machine has stopped. Save work and keep a recovery kernel before the
+first game on such a CPU. Other CPUs are not virtualized.
 
 ## Migrating From cpuid_fault_emulation And clearcpuid=umip
 

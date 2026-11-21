@@ -10,6 +10,12 @@
     #include <linux/cpu.h>
 #endif
 #include <linux/suspend.h>
+#include <linux/cpuhotplug.h>
+#include <linux/cpumask.h>
+#include <linux/mutex.h>
+#include <linux/sched/signal.h>
+#include <linux/workqueue.h>
+#include <asm/thread_info.h>
 
 #include <linux/types.h>
 #include <asm/desc.h>
@@ -53,14 +59,36 @@
 #define page_to_phys(page) PFN_PHYS(page_to_pfn(page))
 #endif
 
-/* The hypervisor doesn't handle nested virtualization, so it only starts on a kernel
- * that does not use SVM itself (kvm_amd loaded, for example). */
+/* The hypervisor doesn't handle nested virtualization, so it only starts while the kernel
+ * does not use SVM itself (a running KVM guest, or kvm_amd with eager virtualization). */
 static struct {
 	struct page* msrpm_page;
 	u64 msrpm_pa;
 	bool prev_cpuid_fault_cap;
 	bool prev_svm_enabled;
 } shared_data;
+
+/*
+ * The hypervisor runs only while a process has CPUID faulting enabled. arch_prctl(ARCH_SET_CPUID)
+ * starts it, and a delayed work stops it once no thread has the faulting flag any more, so KVM
+ * can use SVM in between. hv_lock serializes starting and stopping; hv_inflight counts the
+ * ARCH_SET_CPUID calls that are underway, which keeps the work from stopping the hypervisor
+ * before the call has set the flag.
+ */
+static DEFINE_MUTEX(hv_lock);
+static atomic_t hv_inflight = ATOMIC_INIT(0);
+static bool hv_on;
+static bool hv_stopping;
+static bool on_demand;
+static unsigned int hv_idle_scans;
+static enum cpuhp_state hv_cpuhp_state;
+/* The CPUs that run the hypervisor now. */
+static struct cpumask hv_cpus;
+static void hv_idle_check(struct work_struct *work);
+static DECLARE_DELAYED_WORK(hv_idle_work, hv_idle_check);
+
+#define HV_IDLE_INTERVAL (3 * HZ)
+#define HV_IDLE_SCANS 2
 
 
 inline static void vmsave(u64 vmcb_pa) {
@@ -560,6 +588,44 @@ static int devirtualize_processor(void* processor_number) {
 	return 0;
 }
 
+static int hv_virtualize_cpu(void *processor_number) {
+	int result = virtualize_processor(processor_number);
+
+	if (!result)
+		cpumask_set_cpu((u32)(u64)processor_number, &hv_cpus);
+	return result;
+}
+
+static int hv_devirtualize_cpu(void *processor_number) {
+	devirtualize_processor(processor_number);
+	cpumask_clear_cpu((u32)(u64)processor_number, &hv_cpus);
+	return 0;
+}
+
+/* Virtualizes the CPUs that are not yet; the caller holds the CPU hotplug lock. */
+static int hv_virtualize_all(void) {
+	u32 cpu;
+	int result = 0;
+
+	for_each_online_cpu(cpu) {
+		if (cpumask_test_cpu(cpu, &hv_cpus))
+			continue;
+		result = smp_call_on_cpu(cpu, hv_virtualize_cpu, (void*)(u64)cpu, true);
+		if (result)
+			break;
+	}
+	return result;
+}
+
+static void hv_devirtualize_all(void) {
+	u32 cpu;
+
+	for_each_online_cpu(cpu) {
+		if (cpumask_test_cpu(cpu, &hv_cpus))
+			smp_call_on_cpu(cpu, hv_devirtualize_cpu, (void*)(u64)cpu, true);
+	}
+}
+
 /* called when a Power Management (e.g. suspend) event is about to happen */
 static int handle_pm_notification(struct notifier_block* nb, unsigned long action, void *data) {
 
@@ -567,10 +633,7 @@ static int handle_pm_notification(struct notifier_block* nb, unsigned long actio
 		/* on suspend or hibernation svm is disabled, so
 		 * all processors need to be devirtualized */
 		cpus_read_lock();
-		u32 cpu;
-		for_each_online_cpu(cpu) {
-			smp_call_on_cpu(cpu, devirtualize_processor, (void*)(u64)cpu, true);
-		}
+		hv_devirtualize_all();
 		cpus_read_unlock();
 		/* return the cpuid_fault bit capability to it's previous value */
 		if(!shared_data.prev_cpuid_fault_cap)
@@ -580,10 +643,7 @@ static int handle_pm_notification(struct notifier_block* nb, unsigned long actio
 	if(action == PM_POST_HIBERNATION || action == PM_POST_SUSPEND) {
 		/* revirtualize all processors after suspend or hibernation */
 		cpus_read_lock();
-		u32 cpu;
-		for_each_online_cpu(cpu) {
-			smp_call_on_cpu(cpu, virtualize_processor, (void*)(u64)cpu, true);
-		}
+		hv_virtualize_all();
 		cpus_read_unlock();
 		shared_data.prev_cpuid_fault_cap = test_bit(X86_FEATURE_CPUID_FAULT,
 		                      (unsigned long *)(boot_cpu_data.x86_capability));
@@ -597,25 +657,30 @@ static struct notifier_block pm_notifier = {
 	.notifier_call = handle_pm_notification
 };
 
-int pingu_cpuid_fault_start(bool emulate) {
-	if (test_bit(X86_FEATURE_CPUID_FAULT,
-	             (unsigned long *)(boot_cpu_data.x86_capability))) {
-		pr_info("CPUID faulting is already available (native or the deprecated cpuid_fault_emulation module)\n");
-		return CPUID_FAULT_NATIVE;
-	}
-	if (!emulate) {
-		pr_info("CPUID faulting emulation is disabled\n");
-		return CPUID_FAULT_UNAVAILABLE;
-	}
-	if (!check_svm_support()) {
-		pr_info("CPUID faulting cannot be emulated: the processor has no usable SVM\n");
-		return CPUID_FAULT_UNAVAILABLE;
-	}
-	shared_data.prev_svm_enabled = check_svm_status();
+/* Whether any thread has CPUID faulting enabled; the hypervisor must stay while one does. */
+static bool cpuid_faulting_in_use(void) {
+	struct task_struct *group, *thread;
+	bool found = false;
 
-	if(shared_data.prev_svm_enabled) {
-		pr_info("CPUID faulting cannot be emulated: SVM is already in use (kvm_amd?)\n");
-		return CPUID_FAULT_UNAVAILABLE;
+	rcu_read_lock();
+	for_each_process_thread(group, thread) {
+		if (test_tsk_thread_flag(thread, TIF_NOCPUID)) {
+			found = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return found;
+}
+
+/* The caller holds hv_lock. */
+static int hv_start_locked(void) {
+	int result;
+
+	shared_data.prev_svm_enabled = check_svm_status();
+	if (shared_data.prev_svm_enabled) {
+		pr_warn_ratelimited("CPUID faulting is not available: SVM is in use (a KVM virtual machine is running?)\n");
+		return -EBUSY;
 	}
 
 	shared_data.msrpm_page = alloc_pages(GFP_KERNEL, 1);
@@ -642,34 +707,158 @@ int pingu_cpuid_fault_start(bool emulate) {
 #endif
 
 	cpus_read_lock();
-	u32 cpu;
-	for_each_online_cpu(cpu) {
-		smp_call_on_cpu(cpu, virtualize_processor, (void*)(u64)cpu, true);
+	result = hv_virtualize_all();
+	if (result) {
+		hv_devirtualize_all();
+		cpus_read_unlock();
+		__free_pages(shared_data.msrpm_page, 1);
+		shared_data.msrpm_page = NULL;
+		return result;
 	}
-	cpus_read_unlock();
 	shared_data.prev_cpuid_fault_cap = test_bit(X86_FEATURE_CPUID_FAULT,
 	  (unsigned long *)(boot_cpu_data.x86_capability));
 	set_bit(X86_FEATURE_CPUID_FAULT,
 	        (unsigned long *)(boot_cpu_data.x86_capability));
-
 	register_pm_notifier(&pm_notifier);
+	smp_store_release(&hv_on, true);
+	cpus_read_unlock();
 
-	return CPUID_FAULT_EMULATED;
+	hv_idle_scans = 0;
+	schedule_delayed_work(&hv_idle_work, HV_IDLE_INTERVAL);
+	pr_info("CPUID faulting hypervisor started\n");
+	return 0;
 }
 
-/* Only for a failed load: once the module is up it stays pinned. */
-void pingu_cpuid_fault_stop(void) {
+/* The caller holds hv_lock and has made sure that no thread faults CPUID. */
+static void hv_stop_locked(void) {
 	unregister_pm_notifier(&pm_notifier);
 	if(!shared_data.prev_cpuid_fault_cap)
 		clear_bit(X86_FEATURE_CPUID_FAULT,
 		          (unsigned long *)(boot_cpu_data.x86_capability));
 	cpus_read_lock();
-	u32 cpu;
-	for_each_online_cpu(cpu) {
-		smp_call_on_cpu(cpu, devirtualize_processor, (void*)(u64)cpu, true);
-	}
-
+	hv_devirtualize_all();
+	WRITE_ONCE(hv_on, false);
 	cpus_read_unlock();
 	if (shared_data.msrpm_page)
 		__free_pages(shared_data.msrpm_page, 1);
+	shared_data.msrpm_page = NULL;
+	pr_info("CPUID faulting hypervisor stopped\n");
+}
+
+static void hv_idle_check(struct work_struct *work) {
+	bool busy;
+
+	mutex_lock(&hv_lock);
+	if (!hv_on) {
+		mutex_unlock(&hv_lock);
+		return;
+	}
+	/* New ARCH_SET_CPUID calls wait for the lock from here on. */
+	WRITE_ONCE(hv_stopping, true);
+	smp_mb();
+	busy = atomic_read(&hv_inflight) || cpuid_faulting_in_use();
+	if (busy)
+		hv_idle_scans = 0;
+	else if (++hv_idle_scans >= HV_IDLE_SCANS) {
+		hv_stop_locked();
+		hv_idle_scans = 0;
+	}
+	WRITE_ONCE(hv_stopping, false);
+	if (hv_on)
+		schedule_delayed_work(&hv_idle_work, HV_IDLE_INTERVAL);
+	mutex_unlock(&hv_lock);
+}
+
+/*
+ * Called before the kernel handles arch_prctl(ARCH_SET_CPUID). Returns 0 to go on with the call,
+ * which must be followed by pingu_cpuid_fault_release(); a negative errno to fail it; and 1 to
+ * report success without the call, because enabling CPUID needs no hypervisor.
+ */
+int pingu_cpuid_fault_request(bool disable) {
+	int result;
+
+	if (!on_demand)
+		return 0;
+	atomic_inc(&hv_inflight);
+	smp_mb__after_atomic();
+	if (smp_load_acquire(&hv_on) && !READ_ONCE(hv_stopping))
+		return 0;
+	atomic_dec(&hv_inflight);
+
+	mutex_lock(&hv_lock);
+	if (!hv_on) {
+		if (!disable) {
+			mutex_unlock(&hv_lock);
+			return 1;
+		}
+		result = hv_start_locked();
+		if (result) {
+			mutex_unlock(&hv_lock);
+			return -ENODEV;
+		}
+	}
+	atomic_inc(&hv_inflight);
+	mutex_unlock(&hv_lock);
+	return 0;
+}
+
+void pingu_cpuid_fault_release(void) {
+	if (on_demand)
+		atomic_dec(&hv_inflight);
+}
+
+int pingu_cpuid_fault_status(void) {
+	if (smp_load_acquire(&hv_on))
+		return CPUID_FAULT_EMULATED;
+	return check_svm_status() ? CPUID_FAULT_BUSY : CPUID_FAULT_ON_DEMAND;
+}
+
+static int hv_cpu_online(unsigned int cpu) {
+	/* Runs on the incoming CPU, with the hotplug lock held for writing. */
+	if (smp_load_acquire(&hv_on) && !cpumask_test_cpu(cpu, &hv_cpus))
+		return hv_virtualize_cpu((void*)(u64)cpu);
+	return 0;
+}
+
+static int hv_cpu_offline(unsigned int cpu) {
+	if (cpumask_test_cpu(cpu, &hv_cpus))
+		hv_devirtualize_cpu((void*)(u64)cpu);
+	return 0;
+}
+
+int pingu_cpuid_fault_start(bool emulate) {
+	int result;
+
+	if (test_bit(X86_FEATURE_CPUID_FAULT,
+	             (unsigned long *)(boot_cpu_data.x86_capability))) {
+		pr_info("CPUID faulting is already available (native or the deprecated cpuid_fault_emulation module)\n");
+		return CPUID_FAULT_NATIVE;
+	}
+	if (!emulate) {
+		pr_info("CPUID faulting emulation is disabled\n");
+		return CPUID_FAULT_UNAVAILABLE;
+	}
+	if (!check_svm_support()) {
+		pr_info("CPUID faulting cannot be emulated: the processor has no usable SVM\n");
+		return CPUID_FAULT_UNAVAILABLE;
+	}
+	result = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "x86/pingu_policy:svm",
+	                                   hv_cpu_online, hv_cpu_offline);
+	if (result < 0)
+		return result;
+	hv_cpuhp_state = result;
+	on_demand = true;
+	pr_info("CPUID faulting is emulated on demand: the hypervisor runs while a process faults CPUID\n");
+	return CPUID_FAULT_ON_DEMAND;
+}
+
+/* Only for a failed load: once the module is up it stays pinned. */
+void pingu_cpuid_fault_stop(void) {
+	on_demand = false;
+	cancel_delayed_work_sync(&hv_idle_work);
+	mutex_lock(&hv_lock);
+	if (hv_on)
+		hv_stop_locked();
+	mutex_unlock(&hv_lock);
+	cpuhp_remove_state_nocalls(hv_cpuhp_state);
 }

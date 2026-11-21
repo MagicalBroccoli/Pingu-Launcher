@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::assets;
 use crate::cmd;
 use crate::home::Home;
-use crate::sys::Sys;
+use crate::sys::{CpuInfo, Sys};
 use crate::tools;
 
 const OPTIONS_FILE: &str = "/etc/modprobe.d/pingu-policy.conf";
@@ -112,6 +112,8 @@ pub enum Step {
     Selftest,
     Autoload,
     SteamosFiles,
+    /// Lets kvm claim SVM only while a virtual machine runs, so the CPUID faulting emulation can use it in between.
+    KvmLazy,
     Systemd(&'static [&'static str]),
 }
 
@@ -134,6 +136,9 @@ impl Step {
             Self::Selftest => "Running the native self test".to_string(),
             Self::Autoload => format!("Loading {} on every boot", module.name()),
             Self::SteamosFiles => "Installing the prebuilt modules and their loader".to_string(),
+            Self::KvmLazy => {
+                format!("Letting kvm claim SVM only while a virtual machine runs ({KVM_LAZY_FILE})")
+            }
             Self::Systemd(arguments) => format!("systemctl {}", arguments.join(" ")),
         }
     }
@@ -328,6 +333,9 @@ pub fn plan(sys: &Sys, module: Module) -> Vec<Step> {
     if replaced || !built_for_running_kernel(sys, module) {
         steps.push(Step::DkmsInstall);
     }
+    if kvm_lazy_missing(sys) {
+        steps.push(Step::KvmLazy);
+    }
     if !sys.module_loaded(module.name()) {
         steps.push(Step::Modprobe);
         steps.push(Step::Selftest);
@@ -352,6 +360,61 @@ fn steamos_plan(sys: &Sys, module: Module) -> Vec<Step> {
         steps.push(Step::Selftest);
     }
     steps
+}
+
+/// The kvm option that leaves SVM free until a virtual machine exists; kernels before 6.16 always behave so.
+pub const KVM_LAZY_FILE: &str = "/etc/modprobe.d/pingu-kvm-lazy.conf";
+const KVM_LAZY_TEXT: &str = "# Written by pingu-launcher. kvm claims SVM only while a virtual machine exists, so the CPUID faulting\n# emulation of pingu_policy can use SVM in between. A virtual machine cannot start while a game runs.\noptions kvm enable_virt_at_load=0\n";
+
+/// Whether the CPUID faulting emulation of pingu_policy will run here: an AMD CPU with SVM that cannot fault CPUID itself.
+pub fn needs_kvm_lazy(sys: &Sys) -> bool {
+    let cpu = CpuInfo::read(sys);
+    if cpu.vendor != "AuthenticAMD" || !cpu.has("svm") {
+        return false;
+    }
+    match sys.read("/sys/module/pingu_policy/parameters/cpuid_fault") {
+        Some(state) => matches!(state.trim(), "emulated" | "on_demand" | "busy"),
+        None => !(sys.cpuid_faulting)(),
+    }
+}
+
+fn kvm_lazy_missing(sys: &Sys) -> bool {
+    needs_kvm_lazy(sys) && sys.read(KVM_LAZY_FILE).as_deref() != Some(KVM_LAZY_TEXT)
+}
+
+/// Writes the kvm option and, when no virtual machine runs, reloads kvm so that it applies now.
+fn write_kvm_lazy(sys: &Sys) -> Result<(), String> {
+    let path = sys.path(KVM_LAZY_FILE);
+    assets::install(&path, KVM_LAZY_TEXT.as_bytes(), 0o644)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let eager = |sys: &Sys| {
+        sys.read("/sys/module/kvm/parameters/enable_virt_at_load")
+            .is_some_and(|text| text.trim() == "Y")
+    };
+    if !eager(sys) || !sys.module_loaded("kvm_amd") {
+        return Ok(());
+    }
+    let users = sys
+        .read("/sys/module/kvm_amd/refcnt")
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .unwrap_or(1);
+    if users != 0 {
+        println!(
+            "kvm_amd is in use by a virtual machine. The setting applies after it stops and kvm_amd is reloaded, or after a reboot."
+        );
+        return Ok(());
+    }
+    let reloaded = external(
+        Command::new("modprobe").args(["-r", "kvm_amd", "kvm"]),
+        "modprobe -r",
+    )
+    .and_then(|()| external(Command::new("modprobe").arg("kvm_amd"), "modprobe kvm_amd"));
+    if reloaded.is_err() || eager(sys) {
+        println!(
+            "WARNING: kvm could not be reloaded. The setting applies after a reboot; until then a game cannot use CPUID faulting while kvm_amd holds SVM."
+        );
+    }
+    Ok(())
 }
 
 fn write_steamos_files(sys: &Sys) -> Result<(), String> {
@@ -440,6 +503,7 @@ fn execute(sys: &Sys, home: &Home, module: Module, step: &Step) -> Result<(), St
             }),
         Step::Selftest => tools::selftest(sys, home),
         Step::SteamosFiles => write_steamos_files(sys),
+        Step::KvmLazy => write_kvm_lazy(sys),
         Step::Systemd(arguments) => external(
             Command::new("systemctl").args(*arguments),
             &format!("systemctl {}", arguments[0]),
@@ -558,7 +622,12 @@ pub fn uninstall_plan(sys: &Sys) -> Vec<Removal> {
             }
         }
     }
-    for file in [POLICY_AUTOLOAD, LEGACY_CPUID_AUTOLOAD, OPTIONS_FILE] {
+    for file in [
+        POLICY_AUTOLOAD,
+        LEGACY_CPUID_AUTOLOAD,
+        OPTIONS_FILE,
+        KVM_LAZY_FILE,
+    ] {
         if sys.exists(file) {
             steps.push(Removal::File(file.to_string()));
         }
@@ -989,6 +1058,52 @@ mod tests {
         );
         assert!(installed_for_running_kernel(&sys, Module::Policy));
         assert!(prebuilt_available(&sys, Module::Policy));
+    }
+
+    #[test]
+    fn kvm_is_made_lazy_where_the_cpuid_emulation_runs() {
+        let mut sys = machine("install-kvm-lazy");
+        // Native faulting or a CPU without SVM: nothing to do.
+        assert!(!kvm_lazy_missing(&sys));
+        write(
+            &sys,
+            "proc/cpuinfo",
+            "vendor_id\t: AuthenticAMD\nflags\t\t: fpu svm\n",
+        );
+        assert!(!kvm_lazy_missing(&sys));
+        sys.cpuid_faulting = || false;
+        assert!(kvm_lazy_missing(&sys));
+        let steps = plan(&sys, Module::Policy);
+        let lazy = steps
+            .iter()
+            .position(|step| *step == Step::KvmLazy)
+            .unwrap();
+        let modprobe = steps
+            .iter()
+            .position(|step| *step == Step::Modprobe)
+            .unwrap();
+        assert!(lazy < modprobe, "{steps:?}");
+
+        write_kvm_lazy(&sys).unwrap();
+        assert_eq!(sys.read(KVM_LAZY_FILE).as_deref(), Some(KVM_LAZY_TEXT));
+        assert!(!kvm_lazy_missing(&sys));
+        assert!(!plan(&sys, Module::Policy).contains(&Step::KvmLazy));
+
+        // A loaded module that serves the faulting on demand also counts, whatever the probe says.
+        sys.cpuid_faulting = || true;
+        fs::remove_file(sys.root.join("etc/modprobe.d/pingu-kvm-lazy.conf")).unwrap();
+        write(
+            &sys,
+            "sys/module/pingu_policy/parameters/cpuid_fault",
+            "busy\n",
+        );
+        assert!(kvm_lazy_missing(&sys));
+        write(
+            &sys,
+            "sys/module/pingu_policy/parameters/cpuid_fault",
+            "native\n",
+        );
+        assert!(!kvm_lazy_missing(&sys));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use pingu_launcher::checks::{self, Action, Bootloader, Check, Report, Status};
 use pingu_launcher::mode::GameMode;
 use pingu_launcher::runtime::{RuntimeMode, RuntimeState};
 
-use common::{Fixture, narrow_xcr0, no_faulting, titles};
+use common::{Fixture, faulting, narrow_xcr0, no_faulting, titles};
 
 fn find<'a>(report: &'a Report, title: &str) -> &'a Check {
     report
@@ -357,7 +357,7 @@ fn missing_cpuid_faulting_walks_through_the_module_states() {
         card.warning
     );
 
-    // Loaded, but SVM was taken by KVM.
+    // Loaded, but the module could not offer the emulation.
     fixture.write("sys/module/pingu_policy/parameters/ready", "Y\n");
     fixture.write(
         "sys/module/pingu_policy/parameters/cpuid_fault",
@@ -365,10 +365,42 @@ fn missing_cpuid_faulting_walks_through_the_module_states() {
     );
     let blocked = assert_problem(&fixture.report(), "CPUID faulting");
     assert!(
-        blocked.detail.contains("kvm_amd") && blocked.detail.contains("could not emulate"),
+        blocked.detail.contains("could not emulate") && blocked.detail.contains("did not offer"),
         "{}",
         blocked.detail
     );
+
+    // On demand: the module answers the faulting probe and starts its hypervisor with the game.
+    fixture.sys.cpuid_faulting = faulting;
+    fixture.write(
+        "sys/module/pingu_policy/parameters/cpuid_fault",
+        "on_demand\n",
+    );
+    let on_demand = find(&fixture.report(), "CPUID faulting").clone();
+    assert_eq!(on_demand.status, Status::Ok);
+    assert!(
+        on_demand.detail.contains("on demand"),
+        "{}",
+        on_demand.detail
+    );
+
+    // A running virtual machine holds SVM: launching is refused, and the fix depends on the kvm setting.
+    fixture.write("sys/module/pingu_policy/parameters/cpuid_fault", "busy\n");
+    fixture.write("sys/module/kvm/parameters/enable_virt_at_load", "Y\n");
+    let busy = assert_problem(&fixture.report(), "CPUID faulting");
+    assert!(busy.detail.contains("SVM is in use"), "{}", busy.detail);
+    assert!(busy.fix.contains("module install"), "{}", busy.fix);
+    fixture.write("etc/modprobe.d/pingu-kvm-lazy.conf", "");
+    let busy = assert_problem(&fixture.report(), "CPUID faulting");
+    assert!(busy.fix.contains("modprobe -r kvm_amd kvm"), "{}", busy.fix);
+    fixture.write("sys/module/kvm/parameters/enable_virt_at_load", "N\n");
+    let busy = assert_problem(&fixture.report(), "CPUID faulting");
+    assert!(
+        busy.fix.contains("Stop the virtual machine"),
+        "{}",
+        busy.fix
+    );
+    fixture.sys.cpuid_faulting = no_faulting;
 
     // A module from before the emulation existed.
     fixture.remove("sys/module/pingu_policy/parameters/cpuid_fault");

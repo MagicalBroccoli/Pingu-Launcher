@@ -54,9 +54,14 @@ static int get_cpuid_fault(char *buffer, const struct kernel_param *parameter)
 		[CPUID_FAULT_UNAVAILABLE] = "unavailable",
 		[CPUID_FAULT_NATIVE] = "native",
 		[CPUID_FAULT_EMULATED] = "emulated",
+		[CPUID_FAULT_ON_DEMAND] = "on_demand",
+		[CPUID_FAULT_BUSY] = "busy",
 	};
+	int state = cpuid_fault_state;
 
-	return scnprintf(buffer, PAGE_SIZE, "%s\n", names[cpuid_fault_state]);
+	if (state == CPUID_FAULT_ON_DEMAND)
+		state = pingu_cpuid_fault_status();
+	return scnprintf(buffer, PAGE_SIZE, "%s\n", names[state]);
 }
 
 static const struct kernel_param_ops cpuid_fault_ops = { .get = get_cpuid_fault };
@@ -446,10 +451,24 @@ static void policy_ibt_back_on(void)
 	ibt_disabled = false;
 }
 
+static int __init __nocfi xcr0_probe_lookup_init(void)
+{
+	struct kprobe lookup_probe = { .symbol_name = "kallsyms_lookup_name" };
+	int result;
+
+	if (kernel_lookup)
+		return 0;
+	result = register_kprobe(&lookup_probe);
+	if (result)
+		return result;
+	kernel_lookup = (void *)lookup_probe.addr;
+	unregister_kprobe(&lookup_probe);
+	return 0;
+}
+
 static int __init __nocfi xcr0_probe_setup(void)
 {
 	const void *build_id;
-	struct kprobe lookup_probe = { .symbol_name = "kallsyms_lookup_name" };
 	long displacement;
 	s32 relative;
 	int result;
@@ -464,11 +483,9 @@ static int __init __nocfi xcr0_probe_setup(void)
 		pr_err("xcr0_probe: this kernel boots with FRED but its FRED entry points cannot be hooked; boot with fred=off\n");
 		return -ENODEV;
 	}
-	result = register_kprobe(&lookup_probe);
+	result = xcr0_probe_lookup_init();
 	if (result)
 		return result;
-	kernel_lookup = (void *)lookup_probe.addr;
-	unregister_kprobe(&lookup_probe);
 	build_id = (void *)kernel_lookup("vmlinux_build_id");
 	if (!build_id || memcmp(build_id, xcr0_profile_build_id, sizeof(xcr0_profile_build_id))) {
 		pr_err("xcr0_probe: unsupported kernel build ID (running %*phN, module built for %*phN)\n",
@@ -554,7 +571,7 @@ static int __init __nocfi xcr0_probe_setup(void)
 		memcpy(patch->branch + 1, &relative, sizeof(relative));
 		xcr0_probe_continuations[index] = (unsigned long)(patch->site + patch->length);
 	}
-	result = xcr0_policy_prepare(kernel_lookup);
+	result = xcr0_policy_prepare(kernel_lookup, true);
 	if (result)
 		return result;
 	result = install_patches();
@@ -570,9 +587,25 @@ static int __init __nocfi xcr0_probe_setup(void)
 	return 0;
 }
 
+/* CPUID faulting on demand hooks arch_prctl even where the kernel needs no XCR0 policy. */
+static void __init __nocfi cpuid_hooks_start(void)
+{
+	int result = xcr0_probe_lookup_init();
+
+	if (!result)
+		result = xcr0_policy_prepare(kernel_lookup, false);
+	if (!result)
+		result = xcr0_policy_start();
+	if (result) {
+		pr_err("xcr0_probe: cannot hook arch_prctl: %d; CPUID faulting is not available\n", result);
+		pingu_cpuid_fault_stop();
+		cpuid_fault_state = CPUID_FAULT_UNAVAILABLE;
+	}
+}
+
 static void __init stop_features(void)
 {
-	if (cpuid_fault_state == CPUID_FAULT_EMULATED)
+	if (cpuid_fault_state == CPUID_FAULT_ON_DEMAND)
 		pingu_cpuid_fault_stop();
 	if (umip_fixup_active)
 		pingu_umip_stop();
@@ -616,6 +649,8 @@ static int __init __nocfi xcr0_probe_init(void)
 		}
 		xcr0_policy_active = policy_ready;
 	} else {
+		if (cpuid_fault_state == CPUID_FAULT_ON_DEMAND)
+			cpuid_hooks_start();
 		smp_store_release(&policy_ready, true);
 	}
 	__module_get(THIS_MODULE);

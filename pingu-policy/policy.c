@@ -147,32 +147,41 @@ static bool apply_arch_prctl(int option, unsigned long argument, long *result)
 	return false;
 }
 
-static long __nocfi policy_arch_prctl(const struct pt_regs *regs)
+static long __nocfi call_arch_prctl(int option, unsigned long argument,
+		long (*original)(const struct pt_regs *), const struct pt_regs *regs)
 {
 	long result;
+	int request;
 
-	if (apply_arch_prctl(regs->di, regs->si, &result))
+	if (apply_arch_prctl(option, argument, &result))
 		return result;
-	return original_arch_prctl(regs);
+	if (option != ARCH_SET_CPUID)
+		return original(regs);
+	/* Starts the CPUID faulting hypervisor if this is the first process that wants it. */
+	request = pingu_cpuid_fault_request(!argument);
+	if (request < 0)
+		return request;
+	if (request > 0)
+		return 0;
+	result = original(regs);
+	pingu_cpuid_fault_release();
+	return result;
+}
+
+static long __nocfi policy_arch_prctl(const struct pt_regs *regs)
+{
+	return call_arch_prctl(regs->di, regs->si, original_arch_prctl, regs);
 }
 
 static long __nocfi policy_arch_prctl32(const struct pt_regs *regs)
 {
-	long result;
-
-	if (apply_arch_prctl((unsigned int)regs->bx, (unsigned int)regs->cx, &result))
-		return result;
-	return original_arch_prctl32(regs);
+	return call_arch_prctl((unsigned int)regs->bx, (unsigned int)regs->cx, original_arch_prctl32, regs);
 }
 
 /* Older kernels (6.12 and before) route 32-bit arch_prctl through the compat entry. */
 static long __nocfi policy_arch_prctl32_compat(const struct pt_regs *regs)
 {
-	long result;
-
-	if (apply_arch_prctl((unsigned int)regs->bx, (unsigned int)regs->cx, &result))
-		return result;
-	return original_arch_prctl32_compat(regs);
+	return call_arch_prctl((unsigned int)regs->bx, (unsigned int)regs->cx, original_arch_prctl32_compat, regs);
 }
 
 static int __nocfi policy_copy_thread(struct task_struct *task, const struct kernel_clone_args *arguments)
@@ -233,6 +242,8 @@ struct lifecycle_hook {
 	void *replacement;
 	void **original;
 	bool optional;
+	/* Needed by the XCR0 policy only, not by CPUID faulting on demand. */
+	bool lifecycle;
 	unsigned long address;
 	struct ftrace_ops operations;
 	bool registered;
@@ -243,12 +254,16 @@ static struct lifecycle_hook lifecycle_hooks[] = {
 	{ .name = "__ia32_sys_arch_prctl", .replacement = policy_arch_prctl32, .original = (void **)&original_arch_prctl32 },
 	{ .name = "__ia32_compat_sys_arch_prctl", .replacement = policy_arch_prctl32_compat,
 	  .original = (void **)&original_arch_prctl32_compat, .optional = true },
-	{ .name = "copy_thread", .replacement = policy_copy_thread, .original = (void **)&original_copy_thread },
-	{ .name = "free_task", .replacement = policy_free_task, .original = (void **)&original_free_task },
-	{ .name = "__put_task_struct", .replacement = policy_put_task, .original = (void **)&original_put_task },
+	{ .name = "copy_thread", .replacement = policy_copy_thread, .original = (void **)&original_copy_thread,
+	  .lifecycle = true },
+	{ .name = "free_task", .replacement = policy_free_task, .original = (void **)&original_free_task,
+	  .lifecycle = true },
+	{ .name = "__put_task_struct", .replacement = policy_put_task, .original = (void **)&original_put_task,
+	  .lifecycle = true },
 	{ .name = "__delayed_free_task", .replacement = policy_delayed_free, .original = (void **)&original_delayed_free,
-	  .optional = true },
-	{ .name = "ret_from_fork", .replacement = policy_ret_from_fork, .original = (void **)&original_ret_from_fork },
+	  .optional = true, .lifecycle = true },
+	{ .name = "ret_from_fork", .replacement = policy_ret_from_fork, .original = (void **)&original_ret_from_fork,
+	  .lifecycle = true },
 };
 
 static void notrace lifecycle_redirect(unsigned long instruction, unsigned long parent,
@@ -279,17 +294,21 @@ void xcr0_policy_abort(void)
 		ftrace_free_filter(&lifecycle_hooks[index].operations);
 }
 
-int xcr0_policy_prepare(unsigned long (*lookup)(const char *))
+int xcr0_policy_prepare(unsigned long (*lookup)(const char *), bool lifecycle)
 {
 	unsigned int index;
 	int result;
 
-	for_each_kernel_tracepoint(find_exec_tracepoint, NULL);
-	if (!exec_tracepoint)
-		return -ENOENT;
+	if (lifecycle) {
+		for_each_kernel_tracepoint(find_exec_tracepoint, NULL);
+		if (!exec_tracepoint)
+			return -ENOENT;
+	}
 	for (index = 0; index < ARRAY_SIZE(lifecycle_hooks); index++) {
 		struct lifecycle_hook *hook = &lifecycle_hooks[index];
 
+		if (hook->lifecycle && !lifecycle)
+			continue;
 		hook->address = lookup(hook->name);
 		if (!hook->address && hook->optional)
 			continue;
@@ -305,10 +324,12 @@ int xcr0_policy_prepare(unsigned long (*lookup)(const char *))
 		if (result)
 			goto fail;
 	}
-	result = tracepoint_probe_register(exec_tracepoint, policy_exec, NULL);
-	if (result)
-		goto fail;
-	exec_registered = true;
+	if (lifecycle) {
+		result = tracepoint_probe_register(exec_tracepoint, policy_exec, NULL);
+		if (result)
+			goto fail;
+		exec_registered = true;
+	}
 	return 0;
 fail:
 	xcr0_policy_abort();

@@ -399,14 +399,43 @@ fn can_emulate_cpuid_faulting(cpu: &CpuInfo) -> bool {
     cpu.vendor == "AuthenticAMD" && cpu.has("svm")
 }
 
+/// Why the on-demand emulation cannot start now, and what to do about it.
+fn busy_fix(sys: &Sys) -> String {
+    let exe = shell_quote(&sys.exe);
+    let eager = sys
+        .read("/sys/module/kvm/parameters/enable_virt_at_load")
+        .is_some_and(|text| text.trim() == "Y");
+    if !sys.exists(install::KVM_LAZY_FILE) {
+        format!(
+            "kvm holds SVM all the time. Run `sudo {exe} module install`: it makes kvm claim SVM only while a virtual machine runs. Virtual machines have to be stopped for that."
+        )
+    } else if eager {
+        format!(
+            "{} is not active yet. Reboot, or stop all virtual machines and run:\n  sudo modprobe -r kvm_amd kvm && sudo modprobe kvm_amd",
+            install::KVM_LAZY_FILE
+        )
+    } else {
+        "Stop the virtual machine and launch the game again. The emulation starts by itself once SVM is free.".into()
+    }
+}
+
 fn check_cpuid_faulting(sys: &Sys, cpu: &CpuInfo) -> Check {
     const TITLE: &str = "CPUID faulting";
     let policy = PolicyState::read(sys);
+    if policy.cpuid_fault.as_deref() == Some("busy") {
+        return Check::problem(
+            TITLE,
+            "pingu_policy emulates CPUID faulting when a game asks for it, but SVM is in use right now: a KVM virtual machine is running, or kvm holds SVM all the time.",
+            busy_fix(sys),
+        );
+    }
     if (sys.cpuid_faulting)() {
         let detail = if sys.module_loaded(LEGACY_CPUID_MODULE) {
             "Provided by the deprecated cpuid_fault_emulation module."
         } else if policy.cpuid_fault.as_deref() == Some("emulated") {
-            "Emulated by the pingu_policy module."
+            "Emulated by the pingu_policy module; its hypervisor is running now."
+        } else if policy.cpuid_fault.as_deref() == Some("on_demand") {
+            "Emulated on demand by the pingu_policy module: its hypervisor runs while a game uses CPUID faulting, and KVM virtual machines cannot start then."
         } else {
             "Supported natively by this CPU."
         };
@@ -423,14 +452,14 @@ fn check_cpuid_faulting(sys: &Sys, cpu: &CpuInfo) -> Check {
         let reason = if !can_emulate_cpuid_faulting(cpu) {
             "The CPU has no usable SVM: only AMD CPUs with SVM (AMD-V enabled in the firmware setup) can be emulated."
         } else {
-            "SVM is already in use, most likely by kvm_amd, which also runs the KVM guests. Unload kvm_amd and kvm, or keep them from loading, then reboot."
+            "The module did not offer the emulation: SVM or its NRIP save feature is disabled, emulate_cpuid_fault is 0, or the kernel functions it hooks were not found."
         };
         return Check::problem(
             TITLE,
             format!(
                 "This CPU cannot fault CPUID natively and pingu_policy could not emulate it. {reason}"
             ),
-            "The reason is in the kernel log: sudo dmesg | grep -i xcr0_probe",
+            "The reason is in the kernel log: sudo dmesg | grep -iE 'xcr0_probe|cpuid fault'",
         );
     }
     if !can_emulate_cpuid_faulting(cpu) {
@@ -447,7 +476,7 @@ fn check_cpuid_faulting(sys: &Sys, cpu: &CpuInfo) -> Check {
     )
 }
 
-const SAVE_WORK: &str = "Save your work first: on this CPU loading it runs the whole system as a guest of a thin hypervisor.";
+const SAVE_WORK: &str = "Save your work first: on this CPU the module runs the whole system as a guest of a thin hypervisor while a game uses CPUID faulting.";
 
 const DKMS_LABEL: &str = "Install DKMS module";
 const PREBUILT_LABEL: &str = "Install prebuilt module";
