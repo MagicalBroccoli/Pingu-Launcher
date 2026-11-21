@@ -104,7 +104,10 @@ These combinations were tested with the launcher.
 
 **Launchers**
 
-- Heroic (Phantom Blade Zero, proton-cachyos-slr)
+- Heroic
+- Lutris
+- Steam
+- Faugus
 
 **Hardware**
 
