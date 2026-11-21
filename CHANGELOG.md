@@ -1,3 +1,9 @@
+## v0.3.2 (2026-11-21)
+
+### Feat
+
+- **launcher**: prebuilt modules for the SteamOS stable channel kernels
+
 ## v0.3.1 (2026-11-21)
 
 ### Feat
