@@ -18,6 +18,13 @@ build_id=$(printf %.40s "$build_id")
 modules=$base/modules/$build_id
 
 if [ ! -d "$modules" ]; then
+	# Ostree images keep a copy of the launcher, which builds the module for a new kernel without delaying the boot.
+	if [ -x "$base/pingu-launcher" ] && command -v systemd-run >/dev/null 2>&1; then
+		echo "pingu: no module for kernel $release (build ID $build_id) yet; building it in the background (journalctl -u pingu-modules-rebuild)"
+		systemd-run --quiet --no-block --unit=pingu-modules-rebuild \
+			/bin/sh -c '"$0" module rebuild && systemctl restart pingu-modules.service' "$base/pingu-launcher"
+		exit 0
+	fi
 	echo "pingu: no prebuilt modules for kernel $release (build ID $build_id); install a newer module bundle" >&2
 	exit 1
 fi

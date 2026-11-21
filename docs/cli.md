@@ -77,8 +77,29 @@ On SteamOS there is no DKMS. The release binary carries modules that were built 
 VM-tested against Valve's kernels, and the button reads **Install prebuilt module**
 (`sudo pingu-launcher module install` does the same, and a Deck needs a password set
 with `passwd` first). It installs them with a loader service that survives system
-updates. A kernel that is newer than the launcher needs a newer launcher release. The
-manual steps for other distributions are:
+updates. A kernel that is newer than the launcher needs a newer launcher release.
+
+On ostree images such as Bazzite or Silverblue `/usr` is read-only, so DKMS cannot install
+the module either. The button reads **Build and install module** instead and the same
+command builds `pingu_policy` against the running kernel's headers on the machine, runs
+the VM test, and stores the module under `/var/lib/pingu-runtime/modules/<kernel build ID>/`
+for the loader service (the one SteamOS uses). It needs the headers of the running kernel,
+`gcc`, `make` and `elfutils-libelf-devel` layered into the image, which the card lists with
+the command:
+
+```sh
+sudo rpm-ostree install kernel-devel-$(uname -r) gcc make elfutils-libelf-devel
+systemctl reboot
+```
+
+QEMU with KVM is optional but gives the VM test. The installation also copies the launcher
+to `/var/lib/pingu-runtime/pingu-launcher`; after a kernel update the loader runs
+`pingu-launcher module rebuild` from a transient unit (`pingu-modules-rebuild`, see
+`journalctl -u pingu-modules-rebuild`) so the boot is not delayed, and restarts itself
+when the build is done. With Secure Boot the kernel only loads signed modules: create a key
+with the steps the card shows (`/var/lib/pingu-runtime/mok/MOK.priv` and `MOK.der`), enroll
+it with `mokutil --import`, and the build signs the module with it. The manual steps for
+other distributions are:
 
 ```sh
 sudo pingu-launcher module export /usr/src/pingu-policy-0.5.0

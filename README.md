@@ -43,7 +43,9 @@ itself:
 
 - **Install DKMS module** builds, tests and loads the `pingu-policy` kernel module
   (it needs `dkms` and `pkexec` and asks for your password once). On SteamOS the button
-  reads **Install prebuilt module**. The same module handles UMIP and, on AMD CPUs that
+  reads **Install prebuilt module**. On ostree images such as Bazzite it reads **Build and
+  install module**: it builds the module on the machine, which needs the kernel headers, `gcc`
+  and `make` layered with `rpm-ostree` first ([docs/cli.md](docs/cli.md)). The same module handles UMIP and, on AMD CPUs that
   cannot fault CPUID, the CPUID faulting emulation.
 - **Generate runtime** builds the private library runtime on hosts whose packages contain
   AVX-512 code.

@@ -1,8 +1,9 @@
-//! Installing the kernel modules, through DKMS or from the prebuilt SteamOS set. The steps need root; the window runs them through pkexec.
+//! Installing the kernel modules: through DKMS, from the prebuilt SteamOS set, or built on the device on ostree images. The steps need root; the window runs them through pkexec.
 
 use std::fs;
 use std::io::Write;
 use std::process::Command;
+use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
@@ -17,9 +18,17 @@ const POLICY_AUTOLOAD: &str = "/etc/modules-load.d/pingu-policy.conf";
 /// pkexec's exit codes for a dismissed prompt and for a refusal.
 const PKEXEC_DISMISSED: i32 = 126;
 const PKEXEC_REFUSED: i32 = 127;
-/// SteamOS keeps the prebuilt modules and their loader where an update copies them to the new slot.
+/// SteamOS and ostree images keep the modules and their loader below /var, which updates leave alone.
 const STEAMOS_BASE: &str = "/var/lib/pingu-runtime";
 const STEAMOS_UNIT: &str = "pingu-modules.service";
+/// The loader script, and the copy of this launcher that rebuilds the module on ostree images.
+const LOADER_SCRIPT: &str = "pingu-modules-load";
+const LAUNCHER_COPY: &str = "pingu-launcher";
+/// The transient unit that rebuilds the module in the background after a kernel update.
+pub const REBUILD_UNIT: &str = "pingu-modules-rebuild";
+/// The key pair that signs the module where the kernel only loads signed ones.
+pub const SIGNING_KEY: &str = "/var/lib/pingu-runtime/mok/MOK.priv";
+pub const SIGNING_CERT: &str = "/var/lib/pingu-runtime/mok/MOK.der";
 /// The module that pingu_policy replaced: its DKMS package, boot loading and SteamOS opt-in file.
 const LEGACY_CPUID_PACKAGE: &str = "cpuid_fault_emulation";
 const LEGACY_CPUID_AUTOLOAD: &str = "/etc/modules-load.d/cpuid_fault_emulation.conf";
@@ -112,6 +121,10 @@ pub enum Step {
     Selftest,
     Autoload,
     SteamosFiles,
+    /// Builds, tests and stores the module for the running kernel (ostree).
+    LocalBuild,
+    /// The boot loader service and a copy of this launcher that rebuilds after kernel updates (ostree).
+    LoaderFiles,
     /// Lets kvm claim SVM only while a virtual machine runs, so the CPUID faulting emulation can use it in between.
     KvmLazy,
     Systemd(&'static [&'static str]),
@@ -136,6 +149,13 @@ impl Step {
             Self::Selftest => "Running the native self test".to_string(),
             Self::Autoload => format!("Loading {} on every boot", module.name()),
             Self::SteamosFiles => "Installing the prebuilt modules and their loader".to_string(),
+            Self::LocalBuild => format!(
+                "Building and testing {package} {version} for this kernel (the VM test takes a minute or two)"
+            ),
+            Self::LoaderFiles => {
+                "Installing the boot loader, which rebuilds the module after kernel updates"
+                    .to_string()
+            }
             Self::KvmLazy => {
                 format!("Letting kvm claim SVM only while a virtual machine runs ({KVM_LAZY_FILE})")
             }
@@ -150,10 +170,65 @@ fn has_tool(sys: &Sys, name: &str) -> bool {
         || sys.exists(&format!("/usr/bin/{name}"))
 }
 
+/// Whether a boot service loads the module, instead of DKMS and modules-load.d: SteamOS and ostree images have a read-only /usr.
+pub fn uses_loader(sys: &Sys) -> bool {
+    sys.is_steamos() || sys.is_ostree()
+}
+
+/// What the on-device build needs and the machine lacks, as Fedora package names.
+pub fn local_missing(sys: &Sys) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if !sys.exists(&format!(
+        "/lib/modules/{}/build/Makefile",
+        sys.kernel_release()
+    )) {
+        missing.push("kernel-devel");
+    }
+    if !has_tool(sys, "make") {
+        missing.push("make");
+    }
+    if !has_tool(sys, "gcc") {
+        missing.push("gcc");
+    }
+    if !sys.exists("/usr/include/libelf.h") {
+        missing.push("elfutils-libelf-devel");
+    }
+    missing
+}
+
+/// The command that layers `missing`; the kernel headers must be those of the running kernel.
+pub fn layer_command(missing: &[&str]) -> String {
+    let packages: Vec<String> = missing
+        .iter()
+        .map(|name| match *name {
+            "kernel-devel" => "kernel-devel-$(uname -r)".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    format!("sudo rpm-ostree install {}", packages.join(" "))
+}
+
+/// The module is not signed yet and the kernel would refuse it.
+pub fn signing_key_missing(sys: &Sys) -> bool {
+    sys.module_signature_required() && !(sys.exists(SIGNING_KEY) && sys.exists(SIGNING_CERT))
+}
+
+/// The steps that make a key the kernel trusts; enrolling it needs a reboot and a password prompt of the firmware.
+pub fn signing_steps() -> String {
+    format!(
+        "sudo install -d -m 700 /var/lib/pingu-runtime/mok\nsudo openssl req -new -x509 -newkey rsa:2048 -nodes -days 36500 -outform DER -subj \"/CN=pingu-policy module signing/\" -keyout {SIGNING_KEY} -out {SIGNING_CERT}\nsudo mokutil --import {SIGNING_CERT}\nReboot, enroll the key in the blue MOK manager screen, then press Check again."
+    )
+}
+
 /// The tools the installation needs are there; without them nothing can be installed.
 pub fn available(sys: &Sys) -> bool {
     if sys.is_steamos() {
         return has_tool(sys, "pkexec");
+    }
+    if sys.is_ostree() {
+        return has_tool(sys, "pkexec")
+            && local_missing(sys).is_empty()
+            && !signing_key_missing(sys);
     }
     has_tool(sys, "dkms") && has_tool(sys, "pkexec")
 }
@@ -175,25 +250,34 @@ pub fn vm_test_problem(sys: &Sys) -> Option<&'static str> {
 }
 
 /// Why a module built without the VM test is a risk, for the window and the install log.
-pub fn vm_warning(problem: &str) -> String {
+pub fn vm_warning(sys: &Sys, problem: &str) -> String {
+    let remedy = if sys.is_ostree() {
+        "Layer QEMU (sudo rpm-ostree install qemu-system-x86-core) and reboot to get the test."
+    } else {
+        "Install QEMU to get the test."
+    };
     format!(
         "{problem}, so the module is built without its VM test. That test boots the new kernel \
          with the module in a throwaway virtual machine, where a faulty kernel patch only \
          crashes the VM. Without it only the static checks run, and loading the module can \
-         crash this computer if the kernel is not compatible. Install QEMU to get the test."
+         crash this computer if the kernel is not compatible. {remedy}"
     )
 }
 
 /// The phrase the module tool prints into DKMS's build log when it had to skip the VM test.
 const UNVALIDATED_MARKER: &str = "built WITHOUT its VM test";
 
-/// Whether DKMS built this version for the running kernel without the VM test.
+/// Whether this version was built for the running kernel without the VM test.
 pub fn built_without_vm_test(sys: &Sys, version: &str) -> bool {
-    let log = format!(
-        "{}/{}/x86_64/log/make.log",
-        Module::Policy.dkms_tree(version),
-        sys.kernel_release()
-    );
+    let log = if sys.is_ostree() {
+        local_log(sys)
+    } else {
+        format!(
+            "{}/{}/x86_64/log/make.log",
+            Module::Policy.dkms_tree(version),
+            sys.kernel_release()
+        )
+    };
     sys.read(&log)
         .is_some_and(|text| text.contains(UNVALIDATED_MARKER))
 }
@@ -213,8 +297,35 @@ pub fn steamos_installed_path(sys: &Sys, module: Module) -> Option<String> {
     ))
 }
 
+/// The build log of the module of the running kernel on an ostree image.
+fn local_log(sys: &Sys) -> String {
+    format!(
+        "{STEAMOS_BASE}/logs/{}.log",
+        sys.kernel_build_id().unwrap_or_default()
+    )
+}
+
+/// Where the module built on this machine for the running kernel build is stored.
+pub fn local_module_dir(sys: &Sys) -> Option<String> {
+    Some(format!("{STEAMOS_BASE}/modules/{}", sys.kernel_build_id()?))
+}
+
+/// Whether the module of this launcher was built on this machine for the running kernel build.
+fn local_installed(sys: &Sys, module: Module) -> bool {
+    let Some(directory) = local_module_dir(sys) else {
+        return false;
+    };
+    sys.exists(&format!("{directory}/{}.ko", module.name()))
+        && sys
+            .read(&format!("{directory}/VERSION"))
+            .is_some_and(|text| text.trim() == module.version())
+}
+
 /// Whether the module of this launcher is installed for the running kernel, which a reboot then loads.
 pub fn installed_for_running_kernel(sys: &Sys, module: Module) -> bool {
+    if sys.is_ostree() {
+        return local_installed(sys, module);
+    }
     if !sys.is_steamos() {
         return built_for_running_kernel(sys, module);
     }
@@ -282,6 +393,9 @@ fn loaded_version(sys: &Sys, module: Module) -> Option<String> {
 pub fn plan(sys: &Sys, module: Module) -> Vec<Step> {
     if sys.is_steamos() {
         return steamos_plan(sys, module);
+    }
+    if sys.is_ostree() {
+        return local_plan(sys, module);
     }
     let version = module.version();
     let mut steps = Vec::new();
@@ -362,6 +476,28 @@ fn steamos_plan(sys: &Sys, module: Module) -> Vec<Step> {
     steps
 }
 
+/// An ostree image has no DKMS install: the module is built here, kept below /var and loaded by the service.
+fn local_plan(sys: &Sys, module: Module) -> Vec<Step> {
+    let mut steps = Vec::new();
+    if legacy_cpuid(sys).marker {
+        steps.push(Step::RemoveFile(LEGACY_CPUID_MARKER));
+    }
+    if !local_installed(sys, module) {
+        steps.push(Step::LocalBuild);
+    }
+    if kvm_lazy_missing(sys) {
+        steps.push(Step::KvmLazy);
+    }
+    steps.push(Step::LoaderFiles);
+    steps.push(Step::Systemd(&["daemon-reload"]));
+    steps.push(Step::Systemd(&["enable", STEAMOS_UNIT]));
+    steps.push(Step::Systemd(&["restart", STEAMOS_UNIT]));
+    if !sys.module_loaded(module.name()) {
+        steps.push(Step::Selftest);
+    }
+    steps
+}
+
 /// The kvm option that leaves SVM free until a virtual machine exists; kernels before 6.16 always behave so.
 pub const KVM_LAZY_FILE: &str = "/etc/modprobe.d/pingu-kvm-lazy.conf";
 const KVM_LAZY_TEXT: &str = "# Written by pingu-launcher. kvm claims SVM only while a virtual machine exists, so the CPUID faulting\n# emulation of pingu_policy can use SVM in between. A virtual machine cannot start while a game runs.\noptions kvm enable_virt_at_load=0\n";
@@ -417,6 +553,173 @@ fn write_kvm_lazy(sys: &Sys) -> Result<(), String> {
     Ok(())
 }
 
+/// Writes the loader script and its unit; `with_launcher` also keeps a copy of this launcher that the script runs to rebuild the module after a kernel update.
+fn write_loader(sys: &Sys, with_launcher: bool) -> Result<(), String> {
+    for asset in assets::STEAMOS_LOADER {
+        let destination = if asset.path == STEAMOS_UNIT {
+            sys.path(&format!("/etc/systemd/system/{STEAMOS_UNIT}"))
+        } else {
+            sys.path(STEAMOS_BASE).join(asset.path)
+        };
+        assets::install(&destination, asset.data, asset.mode)
+            .map_err(|error| format!("{}: {error}", destination.display()))?;
+    }
+    if with_launcher {
+        let data = fs::read(&sys.exe).map_err(|error| format!("{}: {error}", sys.exe.display()))?;
+        let destination = sys.path(STEAMOS_BASE).join(LAUNCHER_COPY);
+        assets::install(&destination, &data, 0o755)
+            .map_err(|error| format!("{}: {error}", destination.display()))?;
+    }
+    relabel(sys);
+    Ok(())
+}
+
+/// Best effort: with SELinux enforcing, the loader service and kmod only use files that carry the types of system files.
+fn relabel(sys: &Sys) {
+    if !sys.exists("/sys/fs/selinux/enforce") {
+        return;
+    }
+    let Some(chcon) = sys.which("chcon") else {
+        return;
+    };
+    let base = sys.path(STEAMOS_BASE);
+    let mut attempts = vec![vec![
+        "-R".to_string(),
+        "-t".into(),
+        "modules_object_t".into(),
+        base.join("modules").to_string_lossy().into_owned(),
+    ]];
+    let programs: Vec<String> = [LOADER_SCRIPT, LAUNCHER_COPY]
+        .iter()
+        .map(|name| base.join(name))
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    if !programs.is_empty() {
+        attempts.push(
+            ["-t".to_string(), "bin_t".into()]
+                .into_iter()
+                .chain(programs)
+                .collect(),
+        );
+    }
+    for arguments in attempts {
+        if let Err(error) = external(Command::new(&chcon).args(&arguments), "chcon") {
+            println!("WARNING: {error}. SELinux may keep the service from using the files.");
+        }
+    }
+}
+
+/// Builds the module against the headers of the running kernel, tests it in the VM, signs it if the kernel demands it and stores it where the loader looks.
+fn local_build(sys: &Sys, module: Module) -> Result<(), String> {
+    let release = sys.kernel_release();
+    let build_id = sys
+        .kernel_build_id()
+        .ok_or("Cannot read the kernel build ID from /sys/kernel/notes.")?;
+    let headers = sys.path(&format!("/lib/modules/{release}/build"));
+    let scratch = format!("{STEAMOS_BASE}/build/{build_id}");
+    let work = sys.path(&scratch);
+    remove_path(sys, &scratch, true)?;
+    assets::export_module(&work)?;
+    let make = sys.which("make").unwrap_or_else(|| "make".into());
+    let log = Mutex::new(String::new());
+    let status = cmd::stream(
+        Command::new(make)
+            .arg("-C")
+            .arg(&work)
+            .arg(format!("XCR0_HEADERS={}", headers.display()))
+            .arg(format!("XCR0_RELEASE={release}"))
+            .arg("dkms-validated-build"),
+        &|line| {
+            println!("{line}");
+            if let Ok(mut text) = log.lock() {
+                text.push_str(line);
+                text.push('\n');
+            }
+        },
+    )?;
+    let text = log.into_inner().unwrap_or_default();
+    // A log that cannot be written only costs the warning about a skipped VM test.
+    let _ = assets::install(&sys.path(&local_log(sys)), text.as_bytes(), 0o644);
+    if !status.success() {
+        return Err(format!("Building {} failed ({status}).", module.name()));
+    }
+    let built = work.join(format!("{}.ko", module.name()));
+    if !built.exists() {
+        return Err(format!("The build left no {}.", built.display()));
+    }
+    if sys.module_signature_required() {
+        let (key, cert) = (sys.path(SIGNING_KEY), sys.path(SIGNING_CERT));
+        if !key.exists() || !cert.exists() {
+            return Err(format!(
+                "This kernel only loads signed modules and there is no signing key.\n{}",
+                signing_steps()
+            ));
+        }
+        external(
+            Command::new(headers.join("scripts/sign-file"))
+                .arg("sha256")
+                .arg(&key)
+                .arg(&cert)
+                .arg(&built),
+            "sign-file",
+        )?;
+    }
+    let data = fs::read(&built).map_err(|error| format!("{}: {error}", built.display()))?;
+    let directory = sys.path(&format!("{STEAMOS_BASE}/modules/{build_id}"));
+    let destination = directory.join(format!("{}.ko", module.name()));
+    assets::install(&destination, &data, 0o644)
+        .map_err(|error| format!("{}: {error}", destination.display()))?;
+    // Written last, so a half installed build never counts as installed.
+    let version = directory.join("VERSION");
+    assets::install(
+        &version,
+        format!("{}\n", module.version()).as_bytes(),
+        0o644,
+    )
+    .map_err(|error| format!("{}: {error}", version.display()))?;
+    remove_path(sys, &scratch, true)?;
+    relabel(sys);
+    Ok(())
+}
+
+/// The prerequisites of the on-device build as an error text, or None when they are met.
+fn local_prerequisites(sys: &Sys) -> Option<String> {
+    let missing = local_missing(sys);
+    if !missing.is_empty() {
+        return Some(format!(
+            "The module is built on this machine and needs {}. Layer them, reboot, and run this again:\n{}",
+            missing.join(", "),
+            layer_command(&missing)
+        ));
+    }
+    if signing_key_missing(sys) {
+        return Some(format!(
+            "This kernel only loads signed modules. Make and enroll a signing key first:\n{}",
+            signing_steps()
+        ));
+    }
+    None
+}
+
+/// Builds the module for the running kernel without touching the service; the loader runs this after a kernel update. Must run as root.
+pub fn rebuild(sys: &Sys, module: Module) -> Result<(), String> {
+    // SAFETY: geteuid has no arguments and cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("Rebuilding a module needs root.".into());
+    }
+    if !sys.is_ostree() {
+        return Err(
+            "module rebuild is for ostree images; other systems rebuild through DKMS.".into(),
+        );
+    }
+    if let Some(problem) = local_prerequisites(sys) {
+        return Err(problem);
+    }
+    println!("==> {}", Step::LocalBuild.describe(module));
+    local_build(sys, module)
+}
+
 fn write_steamos_files(sys: &Sys) -> Result<(), String> {
     let mut builds: Vec<&str> = sys
         .steamos_modules
@@ -439,16 +742,7 @@ fn write_steamos_files(sys: &Sys) -> Result<(), String> {
         assets::install(&destination, asset.data, 0o644)
             .map_err(|error| format!("{}: {error}", destination.display()))?;
     }
-    for asset in assets::STEAMOS_LOADER {
-        let destination = if asset.path == STEAMOS_UNIT {
-            sys.path(&format!("/etc/systemd/system/{STEAMOS_UNIT}"))
-        } else {
-            sys.path(STEAMOS_BASE).join(asset.path)
-        };
-        assets::install(&destination, asset.data, asset.mode)
-            .map_err(|error| format!("{}: {error}", destination.display()))?;
-    }
-    Ok(())
+    write_loader(sys, false)
 }
 
 fn external(command: &mut Command, what: &str) -> Result<(), String> {
@@ -503,6 +797,8 @@ fn execute(sys: &Sys, home: &Home, module: Module, step: &Step) -> Result<(), St
             }),
         Step::Selftest => tools::selftest(sys, home),
         Step::SteamosFiles => write_steamos_files(sys),
+        Step::LocalBuild => local_build(sys, module),
+        Step::LoaderFiles => write_loader(sys, true),
         Step::KvmLazy => write_kvm_lazy(sys),
         Step::Systemd(arguments) => external(
             Command::new("systemctl").args(*arguments),
@@ -540,12 +836,15 @@ pub fn run(sys: &Sys, home: &Home, module: Module) -> Result<(), String> {
             sys.kernel_build_id().unwrap_or_default()
         ));
     }
+    if let Some(problem) = sys.is_ostree().then(|| local_prerequisites(sys)).flatten() {
+        return Err(problem);
+    }
     for step in plan(sys, module) {
         println!("==> {}", step.describe(module));
-        if step == Step::DkmsInstall
+        if matches!(step, Step::DkmsInstall | Step::LocalBuild)
             && let Some(problem) = vm_test_problem(sys)
         {
-            println!("WARNING: {}", vm_warning(problem));
+            println!("WARNING: {}", vm_warning(sys, problem));
         }
         execute(sys, home, module, &step)?;
     }
@@ -600,7 +899,7 @@ fn subdirectories(sys: &Sys, absolute: &str) -> Vec<String> {
 /// Everything the installation put on the system; the user's data directory is not part of it.
 pub fn uninstall_plan(sys: &Sys) -> Vec<Removal> {
     let mut steps = Vec::new();
-    if sys.is_steamos() {
+    if uses_loader(sys) {
         let unit = format!("/etc/systemd/system/{STEAMOS_UNIT}");
         if sys.exists(&unit) {
             steps.push(Removal::Systemd(&["disable", "--now", STEAMOS_UNIT]));
@@ -609,6 +908,9 @@ pub fn uninstall_plan(sys: &Sys) -> Vec<Removal> {
         }
         if sys.exists(STEAMOS_BASE) {
             steps.push(Removal::Tree(STEAMOS_BASE.to_string()));
+        }
+        if sys.exists(KVM_LAZY_FILE) {
+            steps.push(Removal::File(KVM_LAZY_FILE.to_string()));
         }
         return steps;
     }
@@ -1060,6 +1362,208 @@ mod tests {
         assert!(prebuilt_available(&sys, Module::Policy));
     }
 
+    /// A Bazzite-like machine: ostree, kernel build ID `aa`, headers and the build tools in `bin`.
+    fn ostree(name: &str) -> Sys {
+        use std::os::unix::fs::PermissionsExt;
+        let mut sys = machine(name);
+        sys.env.insert(
+            "PATH".into(),
+            sys.root.join("bin").to_string_lossy().into_owned(),
+        );
+        write(&sys, "run/ostree-booted", "");
+        let mut notes = Vec::new();
+        for word in [4u32, 1, 3] {
+            notes.extend(word.to_ne_bytes());
+        }
+        notes.extend(b"GNU\0");
+        notes.push(0xaa);
+        notes.extend([0u8; 3]);
+        fs::create_dir_all(sys.root.join("sys/kernel")).unwrap();
+        fs::write(sys.root.join("sys/kernel/notes"), notes).unwrap();
+        write(&sys, "lib/modules/7.3.5-test/build/Makefile", "");
+        write(&sys, "usr/include/libelf.h", "");
+        // The fake make builds a module where the real one would.
+        write(
+            &sys,
+            "bin/make",
+            "#!/bin/sh\necho \"make $*\"\ncd \"$2\" && printf built > pingu_policy.ko\n",
+        );
+        write(&sys, "bin/gcc", "#!/bin/sh\n");
+        write(&sys, "bin/pkexec", "#!/bin/sh\n");
+        for tool in ["make", "gcc", "pkexec"] {
+            let path = sys.root.join("bin").join(tool);
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        sys
+    }
+
+    #[test]
+    fn ostree_builds_here_and_loads_through_the_service() {
+        let sys = ostree("install-ostree-plan");
+        assert!(uses_loader(&sys) && available(&sys));
+        let reload = Step::Systemd(&["daemon-reload"]);
+        let enable = Step::Systemd(&["enable", STEAMOS_UNIT]);
+        let restart = Step::Systemd(&["restart", STEAMOS_UNIT]);
+        assert_eq!(
+            plan(&sys, Module::Policy),
+            [
+                Step::LocalBuild,
+                Step::LoaderFiles,
+                reload,
+                enable,
+                restart,
+                Step::Selftest
+            ]
+        );
+    }
+
+    #[test]
+    fn ostree_skips_the_build_when_this_version_is_stored_for_the_kernel() {
+        let sys = ostree("install-ostree-done");
+        write(&sys, "var/lib/pingu-runtime/modules/aa/pingu_policy.ko", "");
+        assert!(!installed_for_running_kernel(&sys, Module::Policy));
+        write(&sys, "var/lib/pingu-runtime/modules/aa/VERSION", "0.0.1\n");
+        assert!(!installed_for_running_kernel(&sys, Module::Policy));
+        write(
+            &sys,
+            "var/lib/pingu-runtime/modules/aa/VERSION",
+            &format!("{}\n", Module::Policy.version()),
+        );
+        assert!(installed_for_running_kernel(&sys, Module::Policy));
+        assert!(!plan(&sys, Module::Policy).contains(&Step::LocalBuild));
+    }
+
+    #[test]
+    fn ostree_names_what_the_build_lacks() {
+        let sys = ostree("install-ostree-missing");
+        assert!(local_missing(&sys).is_empty());
+        fs::remove_dir_all(sys.root.join("lib/modules")).unwrap();
+        fs::remove_file(sys.root.join("bin/gcc")).unwrap();
+        let missing = local_missing(&sys);
+        assert_eq!(missing, ["kernel-devel", "gcc"]);
+        assert_eq!(
+            layer_command(&missing),
+            "sudo rpm-ostree install kernel-devel-$(uname -r) gcc"
+        );
+        assert!(!available(&sys));
+    }
+
+    #[test]
+    fn a_kernel_that_demands_signatures_needs_a_key_before_anything_is_built() {
+        let sys = ostree("install-ostree-signing");
+        write(
+            &sys,
+            "sys/kernel/security/lockdown",
+            "none [integrity] confidentiality\n",
+        );
+        assert!(sys.module_signature_required() && signing_key_missing(&sys));
+        assert!(!available(&sys));
+        let error = local_build(&sys, Module::Policy).unwrap_err();
+        assert!(error.contains("no signing key"), "{error}");
+        assert!(!sys.root.join("var/lib/pingu-runtime/modules/aa").exists());
+    }
+
+    #[test]
+    fn the_local_build_stores_the_module_signs_it_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let sys = ostree("install-ostree-build");
+        write(&sys, "sys/module/module/parameters/sig_enforce", "Y\n");
+        write(&sys, "var/lib/pingu-runtime/mok/MOK.priv", "key");
+        write(&sys, "var/lib/pingu-runtime/mok/MOK.der", "cert");
+        write(
+            &sys,
+            "lib/modules/7.3.5-test/build/scripts/sign-file",
+            "#!/bin/sh\nprintf signed >> \"$4\"\n",
+        );
+        fs::set_permissions(
+            sys.root
+                .join("lib/modules/7.3.5-test/build/scripts/sign-file"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(available(&sys));
+        local_build(&sys, Module::Policy).unwrap();
+        let base = sys.root.join("var/lib/pingu-runtime");
+        assert_eq!(
+            fs::read(base.join("modules/aa/pingu_policy.ko")).unwrap(),
+            b"builtsigned"
+        );
+        assert!(!base.join("build/aa").exists());
+        assert!(
+            fs::read_to_string(base.join("logs/aa.log"))
+                .unwrap()
+                .contains("make -C")
+        );
+        assert!(installed_for_running_kernel(&sys, Module::Policy));
+        assert!(!built_without_vm_test(&sys, &Module::Policy.version()));
+        write(
+            &sys,
+            "var/lib/pingu-runtime/logs/aa.log",
+            &format!("pingu-module-tool: {UNVALIDATED_MARKER}\n"),
+        );
+        assert!(built_without_vm_test(&sys, &Module::Policy.version()));
+    }
+
+    #[test]
+    fn a_failing_build_stores_nothing() {
+        let sys = ostree("install-ostree-failed");
+        write(&sys, "bin/make", "#!/bin/sh\nexit 2\n");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(sys.root.join("bin/make"), fs::Permissions::from_mode(0o755)).unwrap();
+        let error = local_build(&sys, Module::Policy).unwrap_err();
+        assert!(error.contains("failed"), "{error}");
+        assert!(!sys.root.join("var/lib/pingu-runtime/modules/aa").exists());
+    }
+
+    #[test]
+    fn the_loader_comes_with_a_copy_of_the_launcher_on_ostree() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut sys = ostree("install-ostree-loader");
+        let exe = sys.root.join("opt/pingu-launcher");
+        write(&sys, "opt/pingu-launcher", "launcher bytes");
+        sys.exe = exe;
+        write_loader(&sys, true).unwrap();
+        let base = sys.root.join("var/lib/pingu-runtime");
+        assert_eq!(
+            fs::read(base.join("pingu-launcher")).unwrap(),
+            b"launcher bytes"
+        );
+        let mode =
+            |path: &std::path::Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&base.join("pingu-launcher")), 0o755);
+        assert_eq!(mode(&base.join("pingu-modules-load")), 0o755);
+        assert!(
+            sys.root
+                .join("etc/systemd/system/pingu-modules.service")
+                .exists()
+        );
+        // SteamOS keeps no copy.
+        let other = steamos("install-steamos-no-copy");
+        write_loader(&other, false).unwrap();
+        assert!(
+            !other
+                .root
+                .join("var/lib/pingu-runtime/pingu-launcher")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn uninstalling_on_ostree_removes_the_loader_and_everything_below_var() {
+        let sys = ostree("uninstall-ostree");
+        write(&sys, "etc/systemd/system/pingu-modules.service", "");
+        write(&sys, "var/lib/pingu-runtime/modules/aa/pingu_policy.ko", "");
+        assert_eq!(
+            uninstall_plan(&sys),
+            [
+                Removal::Systemd(&["disable", "--now", STEAMOS_UNIT]),
+                Removal::File("/etc/systemd/system/pingu-modules.service".into()),
+                Removal::Systemd(&["daemon-reload"]),
+                Removal::Tree(STEAMOS_BASE.into()),
+            ]
+        );
+    }
+
     #[test]
     fn kvm_is_made_lazy_where_the_cpuid_emulation_runs() {
         let mut sys = machine("install-kvm-lazy");
@@ -1104,6 +1608,25 @@ mod tests {
             "native\n",
         );
         assert!(!kvm_lazy_missing(&sys));
+    }
+
+    #[test]
+    fn ostree_makes_kvm_lazy_before_the_loader_starts_the_module() {
+        let mut sys = ostree("install-ostree-kvm-lazy");
+        write(
+            &sys,
+            "proc/cpuinfo",
+            "vendor_id\t: AuthenticAMD\nflags\t\t: fpu svm\n",
+        );
+        sys.cpuid_faulting = || false;
+        let steps = plan(&sys, Module::Policy);
+        assert_eq!(
+            steps[..3],
+            [Step::LocalBuild, Step::KvmLazy, Step::LoaderFiles]
+        );
+        write(&sys, "etc/systemd/system/pingu-modules.service", "");
+        write(&sys, "etc/modprobe.d/pingu-kvm-lazy.conf", "");
+        assert!(uninstall_plan(&sys).contains(&Removal::File(KVM_LAZY_FILE.into())));
     }
 
     #[test]

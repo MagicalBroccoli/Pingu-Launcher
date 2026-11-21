@@ -111,6 +111,7 @@ pub fn run(sys: &Sys, home: &Home, tool: Tool) -> Result<(), String> {
             };
             install::run(sys, &home, Module::Policy)
         }
+        Tool::RebuildModule => install::rebuild(sys, Module::Policy),
         Tool::UninstallModules => install::uninstall(sys),
         Tool::Prepare { proton } => {
             let helper = home.bin().join("avx2-run");

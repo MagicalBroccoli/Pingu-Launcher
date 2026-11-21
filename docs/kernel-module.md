@@ -195,6 +195,26 @@ reach users, and keep old builds in the set for rollbacks. Not tested on a devic
 unit and the installation, Secure Boot or lockdown (they would reject the unsigned
 module), and the Steam Machine itself.
 
+## Ostree images (Bazzite, Silverblue)
+
+`/usr` is read-only, so DKMS could build the module but not install it, and the kernels
+change every few days (Bazzite ships its own `-ogc` kernels per image variant and channel),
+which rules out a prebuilt set. The module is built on the machine instead:
+`pingu-launcher module install` exports the sources below `/var/lib/pingu-runtime/build`,
+runs the same `dkms-validated-build` target as the DKMS package against
+`/lib/modules/<release>/build` (static checks and VM test), signs the result with
+`/var/lib/pingu-runtime/mok/MOK.{priv,der}` when the kernel demands signatures, and stores
+it with its version in `modules/<kernel build ID>/`. The loader of the SteamOS section
+loads it with `insmod`. When the directory for the running kernel is missing at boot and
+the launcher copy exists, the loader starts `pingu-launcher module rebuild` in the
+transient unit `pingu-modules-rebuild`, which then restarts the loader. The layered
+packages are part of each new deployment, so the headers of the new kernel are there at
+that boot.
+
+Not tested on a device: the whole path on a real Bazzite image, the layering of
+`kernel-devel` for a Bazzite kernel, SELinux (the installation labels the files with
+`chcon` on a best effort basis), Secure Boot enrollment and the rebuild at boot.
+
 ## UMIP
 
 With UMIP active the kernel emulates `SGDT` and `SIDT` for user space and stores a zero

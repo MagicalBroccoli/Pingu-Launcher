@@ -480,6 +480,7 @@ const SAVE_WORK: &str = "Save your work first: on this CPU the module runs the w
 
 const DKMS_LABEL: &str = "Install DKMS module";
 const PREBUILT_LABEL: &str = "Install prebuilt module";
+const LOCAL_LABEL: &str = "Build and install module";
 
 /// Adds the install button when the tools are there, or says what is missing.
 fn offer(sys: &Sys, mut check: Check, action: Action) -> Check {
@@ -491,6 +492,19 @@ fn offer(sys: &Sys, mut check: Check, action: Action) -> Check {
         }
         return check;
     }
+    if sys.is_ostree() {
+        // The problem text of an ostree image already names what is missing.
+        if install::available(sys) {
+            check.action = Some(action);
+            check.action_label = LOCAL_LABEL;
+            if install::plan(sys, action.module()).contains(&install::Step::LocalBuild)
+                && let Some(problem) = install::vm_test_problem(sys)
+            {
+                check.warning = install::vm_warning(sys, problem);
+            }
+        }
+        return check;
+    }
     if install::available(sys) {
         check.action = Some(action);
         check.action_label = DKMS_LABEL;
@@ -498,7 +512,7 @@ fn offer(sys: &Sys, mut check: Check, action: Action) -> Check {
             && install::plan(sys, action.module()).contains(&install::Step::DkmsInstall)
             && let Some(problem) = install::vm_test_problem(sys)
         {
-            check.warning = install::vm_warning(problem);
+            check.warning = install::vm_warning(sys, problem);
         }
     } else if !install::dkms_available(sys) {
         check.fix.push_str(
@@ -543,6 +557,52 @@ fn steamos_problem(sys: &Sys, module: Module) -> Option<(String, String)> {
     ))
 }
 
+/// The problem and its fix for a module that is not loaded on an ostree image (Bazzite, Silverblue); None on other systems.
+/// /usr is read-only there, so DKMS cannot install: the module is built here and `pingu-modules.service` loads it.
+fn ostree_problem(sys: &Sys, module: Module) -> Option<(String, String)> {
+    if !sys.is_ostree() {
+        return None;
+    }
+    let name = module.name();
+    let release = sys.kernel_release();
+    let missing = install::local_missing(sys);
+    if !missing.is_empty() {
+        return Some((
+            format!(
+                "This system has a read-only /usr, so {name} is built here for kernel {release} instead of through DKMS. The build needs {}, which {} not installed.",
+                missing.join(", "),
+                if missing.len() == 1 { "is" } else { "are" }
+            ),
+            format!(
+                "{}\nsystemctl reboot\nThen press Check again. The kernel headers must be those of the running kernel ({release}).",
+                install::layer_command(&missing)
+            ),
+        ));
+    }
+    if install::signing_key_missing(sys) {
+        return Some((
+            format!(
+                "This kernel only loads signed modules (Secure Boot), and {name} needs a signing key that the firmware trusts."
+            ),
+            install::signing_steps(),
+        ));
+    }
+    let exe = shell_quote(&sys.exe);
+    if !install::installed_for_running_kernel(sys, module) {
+        return Some((
+            format!("The {name} module is not built for kernel {release} yet."),
+            format!("sudo {exe} module {}", module.subcommand()),
+        ));
+    }
+    Some((
+        format!("The {name} module is built for this kernel but not loaded."),
+        format!(
+            "sudo systemctl restart pingu-modules.service\njournalctl -b -u pingu-modules.service -u {}\nIf the log says the key was rejected, enroll the signing key (see the steps above) and reboot.",
+            install::REBUILD_UNIT
+        ),
+    ))
+}
+
 const MODULE_OPTIONS_FILE: &str = "/etc/modprobe.d/pingu-policy.conf";
 
 fn module_ready(sys: &Sys, module: &str) -> bool {
@@ -558,7 +618,7 @@ fn module_update_steps(sys: &Sys, loaded: Option<&str>, version: &str) -> String
     let exe = shell_quote(&sys.exe);
     let source = format!("/usr/src/pingu-policy-{version}");
     let mut text = String::new();
-    if sys.is_steamos() {
+    if install::uses_loader(sys) {
         let _ = writeln!(text, "sudo {exe} module install");
     } else {
         if sys.exists(MODULE_OPTIONS_FILE) {
@@ -642,10 +702,17 @@ fn policy_module_state(sys: &Sys) -> Check {
             Some(loaded) => {
                 let mut check = Check::ok(TITLE, format!("{MODULE} {loaded} is loaded and ready."));
                 if install::built_without_vm_test(sys, &loaded) {
-                    check.warning = format!(
-                        "DKMS built this module without its VM test, because QEMU or KVM was missing then. That test boots the kernel with the module in a throwaway virtual machine, where a faulty kernel patch only crashes the VM. Install QEMU and rebuild with `sudo dkms install -m pingu-policy -v {loaded} -k {} --force` to get it.",
-                        sys.kernel_release()
-                    );
+                    check.warning = if sys.is_ostree() {
+                        format!(
+                            "The module was built without its VM test, because QEMU or KVM was missing then. That test boots the kernel with the module in a throwaway virtual machine, where a faulty kernel patch only crashes the VM. Layer QEMU (sudo rpm-ostree install qemu-system-x86-core), reboot, then run `sudo rm -r {}` and `sudo {exe} module install` to get it.",
+                            install::local_module_dir(sys).unwrap_or_default()
+                        )
+                    } else {
+                        format!(
+                            "DKMS built this module without its VM test, because QEMU or KVM was missing then. That test boots the kernel with the module in a throwaway virtual machine, where a faulty kernel patch only crashes the VM. Install QEMU and rebuild with `sudo dkms install -m pingu-policy -v {loaded} -k {} --force` to get it.",
+                            sys.kernel_release()
+                        )
+                    };
                 }
                 check
             }
@@ -653,7 +720,9 @@ fn policy_module_state(sys: &Sys) -> Check {
         };
     }
 
-    if let Some((detail, fix)) = steamos_problem(sys, Module::Policy) {
+    if let Some((detail, fix)) =
+        steamos_problem(sys, Module::Policy).or_else(|| ostree_problem(sys, Module::Policy))
+    {
         return offer(
             sys,
             Check::problem(TITLE, detail, fix),

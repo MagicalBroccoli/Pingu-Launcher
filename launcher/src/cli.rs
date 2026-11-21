@@ -40,7 +40,12 @@ Tools:
   runtime audit PATH   Recheck the library closure of a generation
   module export DIR    Write the pingu-policy DKMS sources to DIR
   module install       Install, test and load pingu-policy through DKMS (needs root); also
-                       removes the deprecated cpuid_fault_emulation package
+                       removes the deprecated cpuid_fault_emulation package. On SteamOS it
+                       installs the prebuilt module, on ostree images (Bazzite) it builds the
+                       module here and installs a boot service that rebuilds it after kernel
+                       updates
+  module rebuild       Build pingu-policy for the running kernel on an ostree image (needs
+                       root; the boot service runs it)
   module uninstall     Remove the installed modules and their loading at boot (needs root)
   selftest             Run the native module test (needs the loaded module)
   prepare PROTON_DIR   Print the companion Proton the wrapper would use
@@ -86,6 +91,7 @@ pub enum Tool {
         destination: PathBuf,
     },
     InstallModule,
+    RebuildModule,
     UninstallModules,
     Selftest,
     Prepare {
@@ -177,6 +183,10 @@ fn parse_tool(name: &str, args: Vec<String>) -> Result<Tool, String> {
         ("module", "install") => {
             none(&positional)?;
             Ok(Tool::InstallModule)
+        }
+        ("module", "rebuild") => {
+            none(&positional)?;
+            Ok(Tool::RebuildModule)
         }
         ("module", "uninstall") => {
             none(&positional)?;
@@ -368,6 +378,7 @@ mod tests {
             }
         );
         assert_eq!(tool(&["module", "install"]), Tool::InstallModule);
+        assert_eq!(tool(&["module", "rebuild"]), Tool::RebuildModule);
         assert_eq!(tool(&["module", "uninstall"]), Tool::UninstallModules);
         for removed in ["export-cpuid", "install-cpuid"] {
             match parse(words(&["module", removed])) {

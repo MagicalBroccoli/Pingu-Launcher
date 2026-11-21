@@ -488,7 +488,7 @@ fn unvalidated_warning(problem: &str) -> String {
          That test boots this kernel with the module in a throwaway VM, where a faulty kernel \
          patch crashes the VM instead of this computer. Without it only the static checks ran, \
          and loading the module can crash the system if the kernel is not compatible.\n\
-         Install QEMU and make sure KVM is available, then rebuild with `dkms install --force`.\n"
+         Install QEMU and make sure KVM is available, then build the module again.\n"
     )
 }
 
@@ -771,7 +771,7 @@ done
             text.contains("qemu-system-x86_64 is not installed"),
             "{text}"
         );
-        assert!(text.contains("dkms install --force"), "{text}");
+        assert!(text.contains("make sure KVM is available"), "{text}");
     }
 
     #[test]

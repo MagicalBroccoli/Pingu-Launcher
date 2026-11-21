@@ -104,6 +104,22 @@ impl Sys {
             .is_some_and(|text| text.lines().any(|line| line.trim() == "ID=steamos"))
     }
 
+    /// An ostree image (Bazzite, Silverblue): /usr is read-only and DKMS cannot install modules.
+    pub fn is_ostree(&self) -> bool {
+        self.exists("/run/ostree-booted")
+    }
+
+    /// Whether the kernel loads only modules signed with a trusted key (Secure Boot lockdown or `module.sig_enforce`).
+    pub fn module_signature_required(&self) -> bool {
+        let enforced = self
+            .read("/sys/module/module/parameters/sig_enforce")
+            .is_some_and(|text| text.trim() == "Y");
+        let locked = self
+            .read("/sys/kernel/security/lockdown")
+            .is_some_and(|text| text.contains("[integrity]") || text.contains("[confidentiality]"));
+        enforced || locked
+    }
+
     /// The embedded asset of a prebuilt module for the running kernel build.
     pub fn steamos_module(&self, file: &str) -> Option<&'static crate::assets::Asset> {
         let path = format!("{}/{file}", self.kernel_build_id()?);

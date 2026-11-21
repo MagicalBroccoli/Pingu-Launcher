@@ -613,6 +613,87 @@ fn steamos_offers_the_one_module_for_cpuid_faulting_too() {
     assert!(card.warning.contains("Save your work first"));
 }
 
+/// A Bazzite-like machine: ostree, without the build tools.
+fn ostree(name: &str) -> Fixture {
+    let fixture = Fixture::healthy(name);
+    fixture.remove("sys/module/pingu_policy");
+    fixture.write("run/ostree-booted", "");
+    fixture
+}
+
+fn with_build_tools(fixture: &Fixture) {
+    fixture.write("lib/modules/7.3.3-test/build/Makefile", "");
+    fixture.write("usr/include/libelf.h", "");
+    fixture.executable("bin/make");
+    fixture.executable("bin/gcc");
+    fixture.executable("bin/pkexec");
+}
+
+#[test]
+fn ostree_without_the_build_tools_says_how_to_layer_them() {
+    let fixture = ostree("ostree-no-tools");
+    fixture.executable("bin/pkexec");
+    let check = assert_problem(&fixture.report(), "pingu-policy");
+    assert!(check.detail.contains("read-only /usr"), "{}", check.detail);
+    assert!(check.detail.contains("kernel-devel"), "{}", check.detail);
+    assert!(
+        check
+            .fix
+            .starts_with("sudo rpm-ostree install kernel-devel-$(uname -r) make gcc"),
+        "{}",
+        check.fix
+    );
+    assert!(!check.fix.contains("dkms"), "{}", check.fix);
+    assert_eq!(check.action, None);
+}
+
+#[test]
+fn ostree_offers_to_build_the_module_here() {
+    let fixture = ostree("ostree-build");
+    with_build_tools(&fixture);
+    let check = assert_problem(&fixture.report(), "pingu-policy");
+    assert!(
+        check.detail.contains("not built for kernel 7.3.3-test"),
+        "{}",
+        check.detail
+    );
+    assert_eq!(check.fix, "sudo /opt/pingu-launcher module install");
+    assert_eq!(check.action, Some(Action::InstallPolicyModule));
+    assert_eq!(check.action_label, "Build and install module");
+}
+
+#[test]
+fn ostree_names_the_layering_command_for_a_missing_qemu() {
+    let fixture = ostree("ostree-qemu");
+    with_build_tools(&fixture);
+    let check = assert_problem(&fixture.report(), "pingu-policy");
+    assert!(
+        check
+            .warning
+            .contains("rpm-ostree install qemu-system-x86-core"),
+        "{}",
+        check.warning
+    );
+}
+
+#[test]
+fn ostree_with_secure_boot_asks_for_a_signing_key_first() {
+    let fixture = ostree("ostree-secure-boot");
+    with_build_tools(&fixture);
+    fixture.write(
+        "sys/kernel/security/lockdown",
+        "none [integrity] confidentiality\n",
+    );
+    let check = assert_problem(&fixture.report(), "pingu-policy");
+    assert!(check.fix.contains("mokutil --import"), "{}", check.fix);
+    assert_eq!(check.action, None);
+
+    fixture.write("var/lib/pingu-runtime/mok/MOK.priv", "key");
+    fixture.write("var/lib/pingu-runtime/mok/MOK.der", "cert");
+    let check = assert_problem(&fixture.report(), "pingu-policy");
+    assert_eq!(check.action, Some(Action::InstallPolicyModule));
+}
+
 #[test]
 fn an_older_loaded_module_fails_the_check_with_update_steps() {
     let fixture = Fixture::healthy("loaded-version");
