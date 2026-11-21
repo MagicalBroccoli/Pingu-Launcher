@@ -151,6 +151,12 @@ The launcher is a command prefix: it receives the game's command, wraps it and r
 - **Lutris** starts the game through `umu-run`. Set the prefix to the full path of
   `pingu-launcher` and do not append `%command%`. The launcher finds the original Proton
   in `AVX2_PROTON_PATH` or `PROTONPATH`.
+- **Faugus Launcher** builds `ENV... <launch arguments> [gamemoderun] [mangohud] umu-run <exe>`,
+  so it behaves like Lutris. Enter the full path of `pingu-launcher` as a row of the game's
+  **Launch Arguments** (Settings tab, Tools dropdown). Anything in front of `umu-run`
+  (Faugus's `gamemoderun` and `mangohud`) stays there inside the launcher's namespace, so
+  those checkboxes can stay on. Faugus passes the selected
+  Proton as `PROTONPATH`. Use the native package, not the Flatpak.
 - **Steam** passes its expanded command. Put `/path/to/pingu-launcher %command%` in the
   launch options (one line, and shell-quote paths with spaces). The launcher keeps
   Steam's outer reaper/runtime command, verifies the selected Proton is inside a

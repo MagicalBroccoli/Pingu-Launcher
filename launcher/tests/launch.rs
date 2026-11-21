@@ -134,6 +134,24 @@ fn lutris_commands_run_inside_the_companion_namespace() {
 }
 
 #[test]
+fn overlay_wrappers_stay_in_front_of_umu_run_inside_the_namespace() {
+    let mut fixture = Fixture::healthy("launch-overlay-wrappers");
+    proton(&mut fixture);
+    let launch = build(
+        &fixture,
+        GameMode::Artifact,
+        &["gamemoderun", "mangohud", "umu-run", "game.exe"],
+    );
+
+    assert!(launch.program.ends_with("bin/bwrap"), "{}", launch.program);
+    assert_eq!(
+        launch.args[launch.args.len() - 5..],
+        ["--", "gamemoderun", "mangohud", "umu-run", "game.exe"]
+    );
+    assert!(env(&launch, "PROTONPATH").is_some());
+}
+
+#[test]
 fn steam_commands_replace_proton_in_place() {
     let mut fixture = Fixture::healthy("launch-steam");
     let original = proton(&mut fixture);

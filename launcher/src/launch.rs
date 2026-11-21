@@ -44,10 +44,10 @@ pub fn normalize_command(command: &[String]) -> Vec<String> {
 }
 
 /// Lutris starts the game through umu-run; anything else is Steam's expanded %command%.
+/// Words in front of umu-run (Faugus's `gamemoderun` and `mangohud`) stay in the command, so they
+/// still wrap it inside the namespace.
 pub fn is_lutris(command: &[String]) -> bool {
-    command
-        .first()
-        .is_some_and(|first| base_name(first) == "umu-run")
+    command.iter().any(|word| base_name(word) == "umu-run")
 }
 
 pub fn build(
@@ -140,6 +140,14 @@ mod tests {
     #[test]
     fn umu_run_means_lutris() {
         assert!(is_lutris(&words(&["/usr/bin/umu-run", "g.exe"])));
+        assert!(is_lutris(&words(&[
+            "gamemoderun",
+            "/usr/bin/mangohud",
+            "umu-run",
+            "g.exe"
+        ])));
+        assert!(!is_lutris(&words(&["mangohud", "reaper", "SteamLaunch"])));
+        assert!(!is_lutris(&words(&["gamemoderun"])));
         assert!(!is_lutris(&words(&["reaper", "SteamLaunch"])));
     }
 }

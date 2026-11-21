@@ -78,6 +78,15 @@ Heroic started from the application menu does not have `~/.local/bin` in its `PA
 disables it). Heroic's per-game settings override its global ones, so set the wrapper on each
 game.
 
+**Faugus Launcher:** use the native package, not the Flatpak. Open the game's **Edit** dialog,
+switch to the **Settings** tab and choose **Launch Arguments** in the **Tools** dropdown. Double-click
+the empty row, enter the full path to `pingu-launcher` and press Enter. Faugus puts it directly in
+front of `umu-run`, so do not append `%command%`. Settings such as `AVX2_GPU=nvidia` go on their
+own rows above it. **MangoHud** and **GameMode** can stay ticked: the launcher keeps whatever
+stands in front of `umu-run` (`mangohud`, `gamemoderun`) there inside its namespace. Under **Specific Proton**
+select the original Proton (GE-Proton, proton-cachyos or a custom directory, not the `umu-*`
+runtimes or Steam), and keep the umu runtime enabled. This setup is not yet in the tested list.
+
 Launch the game as usual. Use a new test prefix when changing setups, and back up your
 existing prefix and saves first: this project does not delete, reset or migrate prefixes.
 
@@ -125,7 +134,7 @@ CachyOS), which is when the private runtime is needed.
 ## Requirements
 
 - x86-64 Linux with glibc 2.31 or newer, and a graphical session for the window.
-- Native Steam or Lutris with umu. Flatpak launchers are not supported. An installed
+- Native Steam, Lutris, Heroic or Faugus with umu. Flatpak launchers are not supported. An installed
   Proton that requires Steam Linux Runtime, with that runtime already downloaded.
 - Bubblewrap with `--ro-overlay` support.
 - For the kernel module: matching kernel headers, the installed kernel image, the
@@ -261,8 +270,9 @@ This project builds on the work of others:
   GloriousEggroll, **proton-cachyos** by [CachyOS](https://cachyos.org), **umu-launcher**,
   **Steam Linux Runtime** and **bubblewrap**: the stack the launcher wraps. None of them are
   bundled.
-- **[Lutris](https://lutris.net)**, **[Heroic Games Launcher](https://heroicgameslauncher.com)**
-  and **Steam**: the launchers it works with.
+- **[Lutris](https://lutris.net)**, **[Heroic Games Launcher](https://heroicgameslauncher.com)**,
+  **[Faugus Launcher](https://github.com/Faugus/faugus-launcher)** and **Steam**: the launchers
+  it works with.
 - The **Linux kernel** and **DKMS**: the modules are built against your kernel through them.
 
 All trademarks belong to their owners. Games are named only to report what was tested.
