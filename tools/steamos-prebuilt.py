@@ -4,7 +4,7 @@
 SteamOS has a read-only root and neither DKMS nor a compiler, so the modules are built
 here against the exact linux-neptune packages Valve ships. `make launcher-dist` embeds them
 into the launcher, which installs them on the device. Every kernel build gets its own
-directory below the output, named by its build ID: Valve's channels (jupiter-main, jupiter-3.10, ...) ship differently built
+directory below the output, named by its build ID: Valve's channels (jupiter-3.9, jupiter-3.10, jupiter-main, ...) ship differently built
 kernels under the same release string, and the module only accepts its own build.
 
 The packages come from the pacman repository database of the mirror, which names the
@@ -26,8 +26,8 @@ ROOT = Path(__file__).resolve().parent.parent
 MIRROR = "https://steamdeck-packages.steamos.cloud/archlinux-mirror"
 # Kernels before 6.6 are refused by the module build.
 DEFAULT_SERIES = ("68", "611", "615", "616", "618", "72", "73")
-# The release channel first, then the development one.
-DEFAULT_REPOS = ("jupiter-3.10", "jupiter-main")
+# Stable (jupiter-3.9), then beta (jupiter-3.10), then the development one.
+DEFAULT_REPOS = ("jupiter-3.9", "jupiter-3.10", "jupiter-main")
 POLICY_FILES = (
     "Makefile",
     "dkms.conf",
@@ -257,6 +257,26 @@ def build_series(
     return f"{label}: built" + ("" if not arguments.skip_vm else " (VM gate skipped)")
 
 
+def list_builds(arguments: argparse.Namespace) -> list[dict[str, str]]:
+    """One entry per distinct kernel build, for a CI job matrix."""
+    seen = set()
+    builds = []
+    for repo in arguments.repo:
+        packages = read_database(repo, arguments.cache / repo)
+        for series in arguments.series:
+            kernel = packages.get(f"linux-neptune-{series}")
+            headers = packages.get(f"linux-neptune-{series}-headers")
+            if kernel is None or headers is None:
+                continue
+            key = (kernel["SHA256SUM"], headers["SHA256SUM"])
+            if key not in seen:
+                seen.add(key)
+                builds.append(
+                    {"repo": repo, "series": series, "version": kernel["VERSION"]}
+                )
+    return builds
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
@@ -278,6 +298,11 @@ def main() -> int:
     )
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument(
+        "--list",
+        action="store_true",
+        help="print the distinct kernel builds as a JSON job matrix and exit",
+    )
+    parser.add_argument(
         "--force", action="store_true", help="rebuild releases that are up to date"
     )
     parser.add_argument(
@@ -287,6 +312,9 @@ def main() -> int:
     )
     arguments = parser.parse_args()
     arguments.cache = arguments.cache or arguments.work / "packages"
+    if arguments.list:
+        print(json.dumps({"include": list_builds(arguments)}))
+        return 0
     if (
         not (ROOT / "pingu-policy/validation/manifest.json").exists()
         and not arguments.skip_vm

@@ -159,8 +159,8 @@ the real SteamOS boot image. Each release gets `build/steamos/releases/<release>
 with the module, the validation receipt and checksums. `make launcher-dist` runs
 it first and embeds the result (the launcher build reads the directory named by
 `PINGU_STEAMOS_DIR`; a plain `make launcher` embeds none). The embedded set is
-about 150 KB per kernel build. `STEAMOS_ARGS="--series 618 --repo jupiter-beta"` selects
-series and channel. The script needs only Python's standard library, `tar` with zstd
+about 150 KB per kernel build. `STEAMOS_ARGS="--series 618 --repo jupiter-3.10"` selects
+series and channel (`jupiter-3.9` is stable, `jupiter-3.10` beta, `jupiter-main` the development channel; all three are built by default). The script needs only Python's standard library, `tar` with zstd
 support, `make` and the kernel's compiler, plus QEMU/KVM for the VM gate.
 
 Version 0.3.0 (0.4.0 only removed the load parameters) passed the VM gate on the current `jupiter-main` kernels

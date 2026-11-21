@@ -8,18 +8,13 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  plan:
     runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      count: ${{ steps.matrix.outputs.count }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Free disk space
-        run: |
-          # The 14 kernel and header packages and two container images need more than the default.
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
-          df -h /
 
       - name: Check the tag against the launcher version
         run: |
@@ -28,7 +23,25 @@ jobs:
             echo "Tag $GITHUB_REF_NAME does not match launcher version $version" >&2
             exit 1
           fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # One module job per distinct kernel build that Valve currently ships.
+      - name: List the SteamOS kernel builds
+        id: matrix
+        run: |
+          matrix=$(python3 tools/steamos-prebuilt.py --list)
+          echo "$matrix" | jq .
+          echo "matrix=$(echo "$matrix" | jq -c .)" >> "$GITHUB_OUTPUT"
+          echo "count=$(echo "$matrix" | jq '.include | length')" >> "$GITHUB_OUTPUT"
+
+  steamos-module:
+    needs: plan
+    name: SteamOS ${{ matrix.version }} (${{ matrix.repo }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install system packages
         run: |
@@ -49,26 +62,83 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       # Valve builds its kernels on Arch Linux (a new GCC, pahole and objtool libraries that
-      # Ubuntu lacks), so the modules are built and tested in an Arch container with KVM.
-      - name: Build and test the SteamOS modules
+      # Ubuntu lacks), so the module is built and tested in an Arch container with KVM.
+      - name: Build and test the SteamOS module
+        env:
+          REPO: ${{ matrix.repo }}
+          SERIES: ${{ matrix.series }}
         run: |
           make bootstrap pingu-policy/validation/manifest.json
-          podman run --rm --device /dev/kvm -v "$PWD:/src" -w /src docker.io/archlinux/archlinux:base-devel \
+          podman run --rm --device /dev/kvm -e REPO -e SERIES -v "$PWD:/src" -w /src docker.io/archlinux/archlinux:base-devel \
             sh -ec 'pacman -Syu --noconfirm --needed python pahole libelf bc zstd qemu-system-x86 >/dev/null
-                    python3 tools/steamos-prebuilt.py --jobs "$(nproc)"'
-          podman rmi docker.io/archlinux/archlinux:base-devel || true
+                    python3 tools/steamos-prebuilt.py --jobs "$(nproc)" --repo "$REPO" --series "$SERIES"'
 
       - name: Keep the module build logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: steamos-build-logs
+          name: steamos-build-logs-${{ matrix.repo }}-${{ matrix.series }}
           path: .work/steamos/*/*/build.log
 
-      # The modules are up to date now, so this only embeds them.
+      - name: Keep the module
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamos-releases-${{ matrix.repo }}-${{ matrix.series }}
+          path: build/steamos/releases/
+          if-no-files-found: error
+
+  release:
+    needs: [plan, steamos-module]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          # The Debian build container needs more than the default.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Read the launcher version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' launcher/Cargo.toml | head -n 1)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang lld podman python3 zstd curl
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Fetch the SteamOS modules
+        uses: actions/download-artifact@v4
+        with:
+          pattern: steamos-releases-*
+          path: build/steamos/releases
+          merge-multiple: true
+
+      - name: Check that every kernel build has a module
+        env:
+          EXPECTED: ${{ needs.plan.outputs.count }}
+        run: |
+          found=$(find build/steamos/releases -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "$found" -ne "$EXPECTED" ]; then
+            echo "Expected $EXPECTED kernel builds, found $found" >&2
+            exit 1
+          fi
+
+      # The modules are built and tested by the steamos-module jobs, so this only embeds them.
       # The launcher is built in a Debian 11 container, so it runs on glibc 2.31 or newer.
       - name: Build the portable launcher
-        run: make launcher-dist
+        run: |
+          make bootstrap pingu-policy/validation/manifest.json
+          make -o steamos-modules launcher-dist
 
       # The notes list the commits since the previous tag, grouped by commit type.
       - name: Generate the changelog from the commits
