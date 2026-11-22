@@ -1,3 +1,14 @@
+## v0.4.0 (2026-11-22)
+
+### Feat
+
+- warn when artifact.dll loads without Artifact mode
+- **pingu-hook**: cleanup reflex and artifact path (fixes latest Planet Zoo 2 and Crimson Desert + older DenuvOwO titles)
+
+### Fix
+
+- **launcher**: record the original Proton path in the prefix config_info (compatibility with SCSKiller)
+
 ## v0.3.2 (2026-11-21)
 
 ### Feat
