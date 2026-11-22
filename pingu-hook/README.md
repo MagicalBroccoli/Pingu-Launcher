@@ -5,12 +5,12 @@ clocks, signal handling and Wine environment consistent for a game and its child
 processes. `pingu-launcher` embeds the built `pingu-hook.so` and installs it into
 `~/.local/share/pingu-runtime`.
 
-This is derived from the LinUwUx Rust runtime (upstream: `brcly/linuwux-runtime`,
-version 26.9.16, AGPL-3.0, see [LICENSE](LICENSE)). The packages, the built file,
-the exported setup functions and the environment variables use the `pingu-hook`
-and `PINGU_*` names; the launcher's README lists the variables. The design notes
-are in [docs](docs). The upstream installer, wrapper and compatibility list do not
-apply here.
+The library has two compatibility paths and `PINGU_HOOK_PATH` selects one per
+process: `reflex` (default)  `artifact`. The packages, the
+built file, the exported setup functions and the environment variables use the
+`pingu-hook` and `PINGU_*` names; the launcher's `docs/cli.md` lists the variables.
+The design notes are in [docs](docs). The upstream installers, wrappers, kernel
+module and compatibility lists do not apply here.
 
 ## Build
 

@@ -71,7 +71,6 @@ fn log_install_failure() {
     }
 }
 
-#[cfg(feature = "cpuid")]
 pub(super) fn register_reflex_dispatch_handler(handler: u64) {
     register_reflex_image(handler);
 }
@@ -82,7 +81,6 @@ pub(super) fn register_reflex_dispatch_handler(handler: u64) {
 /// covers it. Reflex's own image range, once known, lets
 /// [`should_replay_raw`]'s caller-evidence check exclude Reflex's *internal*
 /// calls (which are never syscall stubs) from the replay path.
-#[cfg(feature = "cpuid")]
 fn register_reflex_image(handler: u64) {
     if handler == 0 || REFLEX_IMAGE_START.load(Ordering::Acquire) != 0 {
         return;
@@ -450,9 +448,9 @@ unsafe extern "C" fn dispatcher_target(
     super::unixlib_repair::maybe_repair_wine_unixlib_exports();
     let trap_rsp = entry_rsp.saturating_add(8);
     let mut tid = 0;
-    if super::reflex_markers::has_active_markers() {
+    if super::markers::has_active_markers() {
         tid = unsafe { libc::gettid() as u64 };
-        super::reflex_markers::retire_markers(tid, trap_rsp);
+        super::markers::retire_markers(tid, trap_rsp);
     }
 
     let stub_match = matches_iat_stub(return_address);
@@ -478,7 +476,7 @@ unsafe extern "C" fn dispatcher_target(
     if tid == 0 {
         tid = unsafe { libc::gettid() as u64 };
     }
-    if !super::reflex_markers::remember_marker(tid, trap_rsp, trap_rip) {
+    if !super::markers::remember_marker(tid, trap_rsp, trap_rip) {
         return original;
     }
     raw | RAW_TARGET_TAG
@@ -505,7 +503,6 @@ static mut BRIDGE_STACKS: BridgeStacks =
 /// own pass in Stage 6 of the syscall redesign plan; see
 /// `docs/protocol/syscall-routing.md` invariant 4 for the ABI parity this
 /// must hold on the direct-replay path.
-#[cfg(feature = "kuser")]
 #[unsafe(naked)]
 unsafe extern "C" fn dispatcher_bridge() {
     core::arch::naked_asm!(
@@ -603,13 +600,13 @@ pub(super) fn install() -> bool {
     if BRIDGE_INSTALLED.load(Ordering::Acquire) {
         return true;
     }
-    let page = WINE_DISPATCHER_SLOT & !(pingu_protocol::kuser::PAGE_SIZE as u64 - 1);
+    let page = WINE_DISPATCHER_SLOT & !(pingu_protocol::PAGE_SIZE as u64 - 1);
     // Wine owns this shared KUSER page. Temporarily make it writable to swap
     // the dispatcher slot, then restore the page's read-only protection.
     if unsafe {
         libc::mprotect(
             page as *mut c_void,
-            pingu_protocol::kuser::PAGE_SIZE,
+            pingu_protocol::PAGE_SIZE,
             libc::PROT_READ | libc::PROT_WRITE,
         )
     } == -1
@@ -630,7 +627,7 @@ pub(super) fn install() -> bool {
     let restored = unsafe {
         libc::mprotect(
             page as *mut c_void,
-            pingu_protocol::kuser::PAGE_SIZE,
+            pingu_protocol::PAGE_SIZE,
             libc::PROT_READ,
         )
     } != -1;

@@ -11,26 +11,9 @@ publish = false
 crate-type = ["rlib", "staticlib"]
 
 [features]
-default = [
-    "cpuid",
-    "hooks",
-    "reflex",
-    "syscall",
-    "kuser",
-    "faketime",
-    "gamescope",
-    "debug",
-    "environment",
-]
-cpuid = []
-hooks = []
-reflex = []
-syscall = []
-kuser = []
-faketime = ["kuser"]
-gamescope = []
+default = ["debug"]
+# Debug logging (`PINGU_DEBUG`, `PINGU_LOG`) and the diagnostics built on it.
 debug = []
-environment = []
 
 [dependencies]
 pingu_protocol = { package = "pingu-hook-protocol", path = ".." }

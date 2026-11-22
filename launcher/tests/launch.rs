@@ -303,14 +303,14 @@ fn a_missing_variant_warns_and_an_unwritable_data_directory_fails() {
     assert!(error.unwrap_err().contains("could not be installed"));
 }
 
-const ARTIFACT_PROTOCOL: &str = "PINGU_ARTIFACT_PROTOCOL";
+const HOOK_PATH: &str = "PINGU_HOOK_PATH";
 
 #[test]
-fn artifact_mode_enables_the_artifact_protocol() {
+fn artifact_mode_selects_the_artifact_path() {
     let mut fixture = Fixture::healthy("launch-artifact-protocol");
     proton(&mut fixture);
     let launch = build(&fixture, GameMode::Artifact, &["umu-run", "game.exe"]);
-    assert_eq!(env(&launch, ARTIFACT_PROTOCOL), Some("1"));
+    assert_eq!(env(&launch, HOOK_PATH), Some("artifact"));
     assert!(
         fixture
             .report()
@@ -320,44 +320,44 @@ fn artifact_mode_enables_the_artifact_protocol() {
     );
 
     let legacy = build(&fixture, GameMode::Legacy, &["umu-run", "game.exe"]);
-    assert_eq!(env(&legacy, ARTIFACT_PROTOCOL), None);
+    assert_eq!(env(&legacy, HOOK_PATH), None);
 }
 
 #[test]
-fn the_artifact_protocol_is_only_enabled_when_xcr0_will_be_7() {
+fn the_artifact_path_is_only_selected_when_xcr0_will_be_7() {
     let mut fixture = Fixture::healthy("launch-v2-xcr0");
     proton(&mut fixture);
     fixture.sys.native_xcr0 = common::narrow_xcr0;
     let launch = build(&fixture, GameMode::Artifact, &["umu-run", "game.exe"]);
-    assert_eq!(env(&launch, ARTIFACT_PROTOCOL), Some("1"));
+    assert_eq!(env(&launch, HOOK_PATH), Some("artifact"));
 
     // Without the restriction the real XCR0 stays wide.
     fixture.sys.native_xcr0 = common::wide_xcr0;
     fixture.set_env("AVX2_POLICY", "0");
     let launch = build(&fixture, GameMode::Artifact, &["umu-run", "game.exe"]);
-    assert_eq!(env(&launch, ARTIFACT_PROTOCOL), None);
+    assert_eq!(env(&launch, HOOK_PATH), None);
 }
 
 #[test]
-fn the_artifact_protocol_is_vendor_independent_and_never_overrides_the_user() {
+fn the_artifact_path_is_vendor_independent_and_never_overrides_the_user() {
     let mut fixture = Fixture::healthy("launch-v2-vendor");
     proton(&mut fixture);
-    fixture.set_env(ARTIFACT_PROTOCOL, "0");
+    fixture.set_env(HOOK_PATH, "0");
     let launch = build(&fixture, GameMode::Artifact, &["umu-run", "game.exe"]);
     assert_eq!(
         launch
             .env
             .iter()
-            .filter(|(name, _)| name == ARTIFACT_PROTOCOL)
+            .filter(|(name, _)| name == HOOK_PATH)
             .count(),
         0
     );
 
-    fixture.sys.env.remove(ARTIFACT_PROTOCOL);
+    fixture.sys.env.remove(HOOK_PATH);
     fixture.write(
         "proc/cpuinfo",
         "vendor_id\t: GenuineIntel\nflags\t\t: fpu\n",
     );
     let launch = build(&fixture, GameMode::Artifact, &["umu-run", "game.exe"]);
-    assert_eq!(env(&launch, ARTIFACT_PROTOCOL), Some("1"));
+    assert_eq!(env(&launch, HOOK_PATH), Some("artifact"));
 }

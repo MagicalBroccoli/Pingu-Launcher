@@ -10,7 +10,7 @@
 //! features: without them, every call simply falls through to Wine's
 //! handler, which is the correct behavior when there is no bridge or Reflex
 //! state to consult. The marker bookkeeping this boundary reads
-//! ([`super::reflex_markers`]) lives in its own file because it needs that
+//! ([`super::markers`]) lives in its own file because it needs that
 //! narrower feature gate; this file owns the decision, not the storage.
 
 use core::ffi::{c_int, c_void};
@@ -52,71 +52,13 @@ fn trace_reflex_hop(
         debug_log_hex(c"reflex hop R10=".as_ptr(), register(libc::REG_R10));
         debug_log_hex(c"reflex hop RDX=".as_ptr(), register(libc::REG_RDX));
         debug_log_hex(c"reflex hop R8=".as_ptr(), register(libc::REG_R8));
-        debug_log_hex(c"reflex hop R9=".as_ptr(), register(libc::REG_R9));
-        // Windows x64 syscall arguments 5-8 live at RSP+0x28..0x48.
-        let rsp = register(libc::REG_RSP);
-        if let Some(arg5) = rsp.checked_add(0x28).and_then(crate::procmem::read_u64) {
-            debug_log_hex(c"reflex hop arg5=".as_ptr(), arg5);
-        }
-        if let Some(arg6) = rsp.checked_add(0x30).and_then(crate::procmem::read_u64) {
-            debug_log_hex(c"reflex hop arg6=".as_ptr(), arg6);
-        }
-    }
-}
-
-/// Debug-only snapshot of a forwarded SIGSYS: the service id and the first
-/// qword of the would-be output buffer (R8) before Wine's handler runs.
-/// Only syscall-looking frames (tiny RAX, userspace R8) are tracked.
-#[cfg(feature = "debug")]
-struct ForwardSnapshot {
-    service: u64,
-    buffer: u64,
-    buffer_before: u64,
-}
-
-#[cfg(feature = "debug")]
-unsafe fn trace_forward_snapshot(context: *mut ucontext_t) -> Option<ForwardSnapshot> {
-    let gregs = unsafe { (*context).uc_mcontext.gregs.as_mut_ptr() };
-    let register = |index: libc::c_int| unsafe { gregs.add(index as usize).read() as u64 };
-    let service = register(libc::REG_RAX);
-    let buffer = register(libc::REG_R8);
-    if service >= 0x200 || !(0x1_0000..0x8000_0000_0000).contains(&buffer) {
-        return None;
-    }
-    let buffer_before = crate::procmem::read_u64(buffer).unwrap_or(u64::MAX);
-    Some(ForwardSnapshot {
-        service,
-        buffer,
-        buffer_before,
-    })
-}
-
-/// After Wine's handler completes a forwarded SIGSYS, report the delivered
-/// result: RAX (an NTSTATUS for bypass replays) and whether the output
-/// buffer's first qword changed while the handler ran.
-#[cfg(feature = "debug")]
-unsafe fn trace_forwarded_result(context: *mut ucontext_t, snapshot: Option<ForwardSnapshot>) {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    let Some(snapshot) = snapshot else { return };
-    static EVENTS: AtomicU64 = AtomicU64::new(0);
-    if EVENTS.fetch_add(1, Ordering::Relaxed) >= 256 {
-        return;
-    }
-    let gregs = unsafe { (*context).uc_mcontext.gregs.as_mut_ptr() };
-    let rax = unsafe { gregs.add(libc::REG_RAX as usize).read() as u64 };
-    let buffer_after = crate::procmem::read_u64(snapshot.buffer).unwrap_or(u64::MAX);
-    unsafe {
-        debug_log_hex(c"forwarded service=".as_ptr(), snapshot.service);
-        debug_log_hex(c"forwarded result rax=".as_ptr(), rax);
-        debug_log_hex(c"forwarded buffer before=".as_ptr(), snapshot.buffer_before);
-        debug_log_hex(c"forwarded buffer after=".as_ptr(), buffer_after);
     }
 }
 
 /// Keep a separate, small budget for the window-list service: the general
 /// Reflex trace is usually exhausted before game initialization reaches it.
 /// The seventh and eighth Windows arguments live on the caller's stack.
-#[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
+#[cfg(feature = "debug")]
 fn trace_window_list(kind: &'static core::ffi::CStr, gregs: *const libc::greg_t) {
     use core::sync::atomic::{AtomicU64, Ordering};
     static EVENTS: AtomicU64 = AtomicU64::new(0);
@@ -157,35 +99,15 @@ struct Route {
     rax_is_resume: bool,
 }
 
-fn artifact_uses_variant2_bypass() -> bool {
-    #[cfg(all(feature = "cpuid", feature = "kuser", feature = "reflex"))]
-    {
-        // Variant 1 keeps Reflex's bypass marker and XMM4 convention.
-        crate::cpuid::artifact_protocol_active() && !crate::cpuid::artifact_variant1()
-    }
-    #[cfg(not(all(feature = "cpuid", feature = "kuser", feature = "reflex")))]
-    {
-        false
-    }
+fn is_bypass(xmm5: &[u8; 16]) -> bool {
+    u64::from_le_bytes(xmm5[..8].try_into().unwrap()) == SYSCALL_BYPASS_MAGIC
 }
 
-fn is_bypass(xmm5: &[u8; 16], variant2_bypass: bool) -> bool {
-    let marker = u64::from_le_bytes(xmm5[..8].try_into().unwrap());
-    if variant2_bypass {
-        return marker == pingu_protocol::artifact::SYSCALL_BYPASS_MAGIC;
-    }
-    marker == SYSCALL_BYPASS_MAGIC
-}
-
-fn syscall_xmm4(selector: u32, previous: [u8; 16], variant2_bypass: bool) -> [u8; 16] {
-    // SimpleSvm executes MOVD XMM4,EAX on both the route and bypass hops.
-    let mut value = if variant2_bypass { [0; 16] } else { previous };
-    value[..4].copy_from_slice(&selector.to_le_bytes());
-    value
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn syscallhook(sig: c_int, info: *mut siginfo_t, context: *mut c_void) {
+pub(crate) unsafe extern "C" fn syscallhook(
+    sig: c_int,
+    info: *mut siginfo_t,
+    context: *mut c_void,
+) {
     let _errno = crate::errno::Errno::save();
     let handled = unsafe {
         redirect(info, context.cast(), |ctx| {
@@ -198,13 +120,7 @@ pub unsafe extern "C" fn syscallhook(sig: c_int, info: *mut siginfo_t, context: 
         })
     };
     if !handled {
-        #[cfg(feature = "debug")]
-        let snapshot = unsafe { trace_forward_snapshot(context.cast()) };
         unsafe { forward_signal(sig, info, context) };
-        #[cfg(feature = "debug")]
-        unsafe {
-            trace_forwarded_result(context.cast(), snapshot)
-        };
     }
 }
 
@@ -226,7 +142,6 @@ unsafe fn redirect(
     }
     let xmm = unsafe { ptr::addr_of_mut!((*fpregs)._xmm).cast::<[u8; 16]>() };
     let xmm5 = unsafe { xmm.add(5).read() };
-    let variant2_bypass = artifact_uses_variant2_bypass();
     let gregs = unsafe { ptr::addr_of_mut!((*context).uc_mcontext.gregs).cast::<libc::greg_t>() };
     let rip = unsafe { gregs.add(libc::REG_RIP as usize).read() as u64 };
     // Every branch below needs the current thread id at least once, and some
@@ -236,7 +151,7 @@ unsafe fn redirect(
     // Every use below is gated by some combination of `kuser`/`reflex`/
     // `debug`; with all three off, `tid` itself would otherwise be unused.
     let _ = tid;
-    #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
+    #[cfg(feature = "debug")]
     let trace_event = {
         let register = |index: libc::c_int| unsafe { gregs.add(index as usize).read() as u64 };
         super::diagnostics::event(
@@ -257,13 +172,12 @@ unsafe fn redirect(
             ],
         )
     };
-    // `bridged` only exists under kuser+reflex (its type, `reflex_markers::
+    // `bridged` only exists under kuser+reflex (its type, `markers::
     // Phase`, is only compiled then) — every read of it below is gated by
     // the same features, so it is simply not declared otherwise, rather
     // than given a placeholder `None` with no type for the compiler to
     // infer from unused dead code.
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    let bridged = super::reflex_markers::consume(
+    let bridged = super::markers::consume(
         tid,
         unsafe { gregs.add(libc::REG_RSP as usize).read() as u64 },
         rip,
@@ -272,23 +186,10 @@ unsafe fn redirect(
         unsafe { gregs.add(libc::REG_R11 as usize).read() as u64 },
         unsafe { gregs.add(libc::REG_EFL as usize).read() as u64 },
     );
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
-    if let Some(super::reflex_markers::Phase::Replay(saved)) = bridged {
-        #[cfg(feature = "debug")]
-        unsafe {
-            debug_log_hex(
-                c"reflex replay restore rax=".as_ptr(),
-                gregs.add(libc::REG_RAX as usize).read() as u64,
-            );
-        }
+    if let Some(super::markers::Phase::Replay(saved)) = bridged {
         unsafe {
             xmm.add(4).write(saved.xmm4);
             xmm.add(5).write(saved.xmm5);
-            if variant2_bypass {
-                let selector = gregs.add(libc::REG_RAX as usize).read() as u32;
-                xmm.add(4).write(syscall_xmm4(selector, saved.xmm4, true));
-                xmm.add(5).write([0; 16]);
-            }
             gregs
                 .add(libc::REG_R11 as usize)
                 .write(saved.r11 as libc::greg_t);
@@ -296,93 +197,65 @@ unsafe fn redirect(
                 .add(libc::REG_EFL as usize)
                 .write(saved.eflags as libc::greg_t);
         }
-        #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
+        #[cfg(feature = "debug")]
         super::diagnostics::record_game_event(
             trace_event.with_disposition(super::diagnostics::Disposition::BridgeReplayRestored),
         );
         return false;
     }
-    if is_bypass(&xmm5, variant2_bypass) {
-        #[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
+    if is_bypass(&xmm5) {
+        #[cfg(feature = "debug")]
         trace_window_list(c"window list Reflex bypass", gregs);
         #[cfg(feature = "debug")]
         trace_reflex_hop(c"reflex bypass replay", tid, rip, gregs);
-        #[cfg(all(feature = "kuser", feature = "reflex"))]
-        if matches!(bridged, Some(super::reflex_markers::Phase::Route)) {
+        if matches!(bridged, Some(super::markers::Phase::Route)) {
             unsafe {
-                super::reflex_markers::cancel(
-                    tid,
-                    gregs.add(libc::REG_RSP as usize).read() as u64,
-                    rip,
-                );
+                super::markers::cancel(tid, gregs.add(libc::REG_RSP as usize).read() as u64, rip);
             }
         }
-        if variant2_bypass {
-            let selector = unsafe { gregs.add(libc::REG_RAX as usize).read() as u32 };
-            let value = syscall_xmm4(selector, [0; 16], true);
-            unsafe { xmm.add(4).write(value) };
-        }
         unsafe { xmm.add(5).write([0; 16]) };
-        #[cfg(all(feature = "kuser", feature = "reflex"))]
         if code == SYS_USER_DISPATCH && super::win32u_zero_list::maybe_complete_bypass(gregs) {
-            #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
+            #[cfg(feature = "debug")]
             super::diagnostics::record_game_event(
                 trace_event.with_disposition(super::diagnostics::Disposition::LocallyCompleted),
             );
             return true;
         }
-        #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
+        #[cfg(feature = "debug")]
         super::diagnostics::record_game_event(
             trace_event.with_disposition(super::diagnostics::Disposition::ReflexBypassForwarded),
         );
         return false;
     }
-    let is_bridged_route = {
-        #[cfg(all(feature = "kuser", feature = "reflex"))]
-        {
-            matches!(bridged, Some(super::reflex_markers::Phase::Route))
-        }
-        #[cfg(not(all(feature = "kuser", feature = "reflex")))]
-        {
-            false
-        }
-    };
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
+    let is_bridged_route = matches!(bridged, Some(super::markers::Phase::Route));
     let is_target_process_route = if is_bridged_route {
         false
     } else {
         let service = unsafe { gregs.add(libc::REG_RAX as usize).read() as u64 };
-        super::reflex_markers::is_registered_target_process(rip, service)
+        super::markers::is_registered_target_process(rip, service)
     };
-    #[cfg(not(all(feature = "kuser", feature = "reflex")))]
-    let is_target_process_route = false;
     if !is_bridged_route && !is_target_process_route {
-        #[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
+        #[cfg(feature = "debug")]
         trace_window_list(c"window list direct Wine route", gregs);
-        #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
+        #[cfg(feature = "debug")]
         super::diagnostics::record_game_event(trace_event);
         return false;
     }
     let Some(selected_route) = route(context) else {
-        #[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
+        #[cfg(feature = "debug")]
         trace_window_list(c"window list unselected Wine route", gregs);
-        #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
+        #[cfg(feature = "debug")]
         super::diagnostics::record_game_event(
             trace_event.with_disposition(super::diagnostics::Disposition::ReflexRouteDeclined),
         );
-        #[cfg(all(feature = "kuser", feature = "reflex"))]
         if is_bridged_route {
             unsafe {
-                super::reflex_markers::cancel(
-                    tid,
-                    gregs.add(libc::REG_RSP as usize).read() as u64,
-                    rip,
-                );
+                super::markers::cancel(tid, gregs.add(libc::REG_RSP as usize).read() as u64, rip);
             }
         }
         return false;
     };
-    #[cfg(all(feature = "debug", feature = "kuser", feature = "reflex"))]
+    #[cfg(feature = "debug")]
     trace_window_list(c"window list Reflex route", gregs);
     #[cfg(feature = "debug")]
     trace_reflex_hop(
@@ -395,7 +268,7 @@ unsafe fn redirect(
         rip,
         gregs,
     );
-    #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
+    #[cfg(feature = "debug")]
     super::diagnostics::record_game_event(
         trace_event.with_disposition(super::diagnostics::Disposition::ReflexRedirected),
     );
@@ -413,8 +286,9 @@ unsafe fn redirect(
         gregs.add(libc::REG_EFL as usize).write(r11);
 
         let selector = gregs.add(libc::REG_RAX as usize).read() as u32;
-        xmm.add(4)
-            .write(syscall_xmm4(selector, xmm.add(4).read(), variant2_bypass));
+        let mut xmm4 = xmm.add(4).read();
+        xmm4[..4].copy_from_slice(&selector.to_le_bytes());
+        xmm.add(4).write(xmm4);
         let rcx = gregs.add(libc::REG_RCX as usize).read() as u64;
         let rax = if selected_route.rax_is_resume {
             syscall_resume(rip, rcx)
@@ -438,33 +312,5 @@ unsafe fn syscall_resume(rip: u64, rcx: u64) -> u64 {
         rip.wrapping_add(2)
     } else {
         rcx
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{is_bypass, syscall_xmm4};
-
-    #[test]
-    fn variant1_selectors_using_the_old_marker_still_reach_artifact() {
-        let mut old = [0x55; 16];
-        old[..8].copy_from_slice(&pingu_protocol::reflex::SYSCALL_BYPASS_MAGIC.to_le_bytes());
-        let mut new = [0x55; 16];
-        new[..8].copy_from_slice(&pingu_protocol::artifact::SYSCALL_BYPASS_MAGIC.to_le_bytes());
-        assert!(is_bypass(&old, false));
-        assert!(!is_bypass(&old, true));
-        assert!(is_bypass(&new, true));
-        assert!(!is_bypass(&new, false));
-    }
-
-    #[test]
-    fn variant2_route_and_replay_use_the_current_service_and_clear_upper_xmm4() {
-        let routed = syscall_xmm4(0x3333, [0xaa; 16], true);
-        assert_eq!(&routed[..4], &0x3333u32.to_le_bytes());
-        assert_eq!(&routed[4..], &[0; 12]);
-        let replayed = syscall_xmm4(0x36, routed, true);
-        assert_eq!(&replayed[..4], &0x36u32.to_le_bytes());
-        assert_eq!(&replayed[4..], &[0; 12]);
-        assert_eq!(&syscall_xmm4(0x3333, [0xaa; 16], false)[4..], &[0xaa; 12]);
     }
 }

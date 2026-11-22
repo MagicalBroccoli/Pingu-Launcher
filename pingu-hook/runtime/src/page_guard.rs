@@ -41,8 +41,8 @@ impl PageGuard {
             unsafe { libc::sigprocmask(libc::SIG_SETMASK, mask.as_ptr(), ptr::null_mut()) };
             return None;
         }
-        if owner != 0 {
-            crate::kuser::recover_patch_after_fork();
+        if owner != 0 && crate::path::is_reflex() {
+            crate::reflex::kuser::recover_patch_after_fork();
         }
         Some(Self {
             mask,

@@ -9,18 +9,17 @@
 //! trap actually reaches it, or how to patch memory. Everything with a side
 //! effect (KUSER patching, logging, yielding, reading/writing the CPU
 //! presentation) goes through the [`Host`] trait, which
-//! `runtime/src/reflex.rs`'s `RuntimeHost` implements by calling back into
+//! `runtime/src/reflex/session.rs`'s `RuntimeHost` implements by calling back into
 //! the unsafe runtime crate. That indirection is what keeps this file
 //! `#![forbid(unsafe_code)]` and unit-testable (see the `tests` module
 //! below) despite driving genuinely unsafe machinery.
 use core::ffi::CStr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::control::{
-    ARM_TARGET_CR3, CLIENT_SESSION_MARKER, DISPATCH_BYPASS_SYSCALL, POLL_KUSER_SPOOF_READY,
-    REGISTER_ATTRIBUTES_HANDLER, REGISTER_ATTRIBUTES_SYSCALL_ID, REGISTER_RESUME_HANDLER,
-    REGISTER_SYSTEM_SYSCALL_ID, REGISTER_TARGET_PID, SET_TIME, SINGLE_DISPATCH_SELECTORS,
-    USER_RCX_MAX,
+    ARM_TARGET_CR3, CLIENT_SESSION_MARKER, DISPATCH_BYPASS_SYSCALL, REGISTER_ATTRIBUTES_HANDLER,
+    REGISTER_ATTRIBUTES_SYSCALL_ID, REGISTER_RESUME_HANDLER, REGISTER_SYSTEM_SYSCALL_ID,
+    REGISTER_TARGET_PID, SET_TIME, SINGLE_DISPATCH_SELECTORS, USER_RCX_MAX,
 };
 
 const TRANSITION_WAIT_LIMIT: u32 = 4096;
@@ -145,7 +144,6 @@ impl RoutingState {
 pub enum Action {
     Native = 0,
     Consumed = 1,
-    KuserSpoofReady = 2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,21 +152,15 @@ pub struct SyscallRoute {
     pub rax_is_resume: bool,
 }
 
-pub use crate::kuser::Recipe as KuserRecipe;
+pub use super::kuser::Recipe as KuserRecipe;
 
 pub trait Host {
     fn set_offset(&self, filetime: u64);
     fn select_legacy_presentation(&self);
     fn legacy_presentation_active(&self) -> bool;
-    fn resume_kuser_recipe(&self) -> KuserRecipe {
-        KuserRecipe::Resume
-    }
     fn selector_kuser_recipe(&self) -> KuserRecipe;
     fn patch_kuser(&self, recipe: KuserRecipe) -> bool;
     fn set_hwprofile_guid(&self) {}
-    fn store_resume_target(&self, target: u64) {
-        let _ = target;
-    }
     fn yield_thread(&self) {
         core::hint::spin_loop();
     }
@@ -200,7 +192,6 @@ pub struct State {
     routing: AtomicU32,
     identity: AtomicU32,
     target_pid: AtomicU64,
-    kuser_spoof_ready: AtomicBool,
     syscall_convention: AtomicU32,
     resume_target: AtomicU64,
     dispatch: DispatchRegistrations,
@@ -212,7 +203,6 @@ impl State {
             routing: AtomicU32::new(RoutingState::Unregistered as u32),
             identity: AtomicU32::new(IdentityState::Unobserved as u32),
             target_pid: AtomicU64::new(0),
-            kuser_spoof_ready: AtomicBool::new(false),
             syscall_convention: AtomicU32::new(SyscallConvention::ResumeReplay as u32),
             resume_target: AtomicU64::new(0),
             dispatch: DispatchRegistrations::new(),
@@ -242,7 +232,7 @@ impl State {
 
     fn kuser_recipe(&self, host: &impl Host) -> KuserRecipe {
         match SyscallConvention::load(&self.syscall_convention) {
-            SyscallConvention::ResumeReplay => host.resume_kuser_recipe(),
+            SyscallConvention::ResumeReplay => KuserRecipe::Resume,
             SyscallConvention::SelectorDispatch => host.selector_kuser_recipe(),
             SyscallConvention::DualDispatch => KuserRecipe::Dispatch,
         }
@@ -347,7 +337,6 @@ impl State {
             }
         }
         self.resume_target.store(target, Ordering::Release);
-        host.store_resume_target(target);
         if host.legacy_presentation_active() {
             SyscallConvention::SelectorDispatch.store(&self.syscall_convention);
         }
@@ -402,12 +391,9 @@ impl State {
                 host.set_offset(argument << 32);
             }
             REGISTER_TARGET_PID => {
-                let _ = self.identity.compare_exchange(
-                    IdentityState::Unobserved as u32,
-                    IdentityState::Process as u32,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+                if self.routing() == Routing::Unregistered {
+                    return Action::Native;
+                }
                 self.target_pid.store(argument, Ordering::Release);
                 host.log_hex(c"reflex target pid=", argument);
                 let recipe = self.kuser_recipe(host);
@@ -415,24 +401,12 @@ impl State {
                     KuserRecipe::Dispatch => c"reflex KUSER recipe=dispatch",
                     KuserRecipe::Selector => c"reflex KUSER recipe=selector",
                     KuserRecipe::Resume => c"reflex KUSER recipe=resume",
-                    KuserRecipe::Variant2Intel => c"reflex KUSER recipe=variant2-intel",
-                    KuserRecipe::Variant2Amd => c"reflex KUSER recipe=variant2-amd",
-                    KuserRecipe::Variant1 => c"reflex KUSER recipe=variant1",
-                    KuserRecipe::Variant3 => c"reflex KUSER recipe=variant3",
                 });
                 if !host.patch_kuser(recipe) {
                     host.log(c"reflex KUSER patch failed");
                     return Action::Native;
                 }
-                self.kuser_spoof_ready.store(true, Ordering::Release);
                 host.log(c"reflex KUSER patch ready");
-            }
-            POLL_KUSER_SPOOF_READY => {
-                if self.kuser_spoof_ready.swap(false, Ordering::AcqRel) {
-                    host.log(c"reflex KUSER spoof ready acknowledged");
-                    return Action::KuserSpoofReady;
-                }
-                return Action::Native;
             }
             REGISTER_SYSTEM_SYSCALL_ID => {
                 Self::log_control(host, leaf, argument);
@@ -515,34 +489,9 @@ impl Default for State {
 
 #[cfg(test)]
 mod tests {
-    use core::ffi::CStr;
     use core::sync::atomic::Ordering;
 
-    use super::{
-        Action, Host, IdentityScope, KuserRecipe, POLL_KUSER_SPOOF_READY, REGISTER_RESUME_HANDLER,
-        REGISTER_TARGET_PID, Routing, SET_TIME, cpuid_argument,
-    };
-
-    struct DummyHost;
-
-    impl Host for DummyHost {
-        fn set_offset(&self, _filetime: u64) {}
-        fn select_legacy_presentation(&self) {}
-        fn legacy_presentation_active(&self) -> bool {
-            false
-        }
-        fn resume_kuser_recipe(&self) -> KuserRecipe {
-            KuserRecipe::Variant2Intel
-        }
-        fn selector_kuser_recipe(&self) -> KuserRecipe {
-            KuserRecipe::Selector
-        }
-        fn patch_kuser(&self, _recipe: KuserRecipe) -> bool {
-            true
-        }
-        fn log(&self, _message: &'static CStr) {}
-        fn log_hex(&self, _prefix: &'static CStr, _value: u64) {}
-    }
+    use super::{REGISTER_RESUME_HANDLER, REGISTER_TARGET_PID, SET_TIME, cpuid_argument};
 
     #[test]
     fn target_pid_uses_rdx_while_other_control_payloads_use_rcx() {
@@ -563,40 +512,6 @@ mod tests {
         state
             .routing
             .store(super::RoutingState::ResumeTarget as u32, Ordering::Release);
-        assert!(state.has_registered_target_process());
-    }
-
-    #[test]
-    fn target_pid_before_resume_handler_arms_kuser_spoof_ready_once() {
-        let state = super::State::new();
-        let host = DummyHost;
-
-        assert_eq!(
-            state.handle_cpuid(POLL_KUSER_SPOOF_READY, 0, 0, &host),
-            Action::Native
-        );
-        assert_eq!(
-            state.handle_cpuid(REGISTER_TARGET_PID, 0, 0x1234, &host),
-            Action::Consumed
-        );
-        assert_eq!(state.target_pid(), Some(0x1234));
-        assert_eq!(state.identity_scope(), IdentityScope::Process);
-        assert!(!state.has_registered_target_process());
-
-        assert_eq!(
-            state.handle_cpuid(POLL_KUSER_SPOOF_READY, 0, 0, &host),
-            Action::KuserSpoofReady
-        );
-        assert_eq!(
-            state.handle_cpuid(POLL_KUSER_SPOOF_READY, 0, 0, &host),
-            Action::Native
-        );
-
-        assert_eq!(
-            state.handle_cpuid(REGISTER_RESUME_HANDLER, 0x7ff0_1000, 0, &host),
-            Action::Consumed
-        );
-        assert_eq!(state.routing(), Routing::ResumeTarget);
         assert!(state.has_registered_target_process());
     }
 }

@@ -265,9 +265,9 @@ and a changelog generated from the commits since the previous tag.
 
 This project builds on the work of others:
 
-- **LinUwUx Rust runtime** by [brcly](https://github.com/brcly/linuwux-runtime) (version
-  26.9.16, AGPL-3.0): `pingu-hook` is derived from it, with renamed packages, variables and
-  protocol variants. The original license text is kept in [pingu-hook/LICENSE](pingu-hook/LICENSE).
+- **LinUwUx Rust runtime** by [brcly](https://github.com/brcly/linuwux-runtime) (AGPL-3.0):
+  the `reflex` path of `pingu-hook` is derived from it, with renamed packages and variables.
+  The original license text is kept in [pingu-hook/LICENSE](pingu-hook/LICENSE).
 - **[Slint](https://slint.dev)**: the launcher window.
 - **[Capstone](https://www.capstone-engine.org)**, liblzma, zstd, bzip2 and
   [musl libc](https://musl.libc.org): the static module helper.

@@ -60,8 +60,8 @@ pub fn build(
     let preload =
         hook::compose_preload(sys.env("LD_PRELOAD"), &library.path, base_name(&command[0]));
     let mut env = vec![("LD_PRELOAD".to_string(), preload)];
-    if report.plan.artifact_protocol && sys.env("PINGU_ARTIFACT_PROTOCOL").is_none() {
-        env.push(("PINGU_ARTIFACT_PROTOCOL".into(), "1".into()));
+    if report.plan.artifact_path && sys.env("PINGU_HOOK_PATH").is_none() {
+        env.push(("PINGU_HOOK_PATH".into(), "artifact".into()));
     }
     let mut notes: Vec<String> = library.warning.into_iter().collect();
 

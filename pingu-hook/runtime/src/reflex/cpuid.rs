@@ -4,7 +4,7 @@
 //! replies),
 //! native-CPUID pass-through and caching for leaves pingu-hook doesn't own, and
 //! the `.init_array` constructor that detects the host vendor at startup.
-//! Reply *content* for a given [`pingu_protocol::cpuid::CpuIdentity`] lives in the
+//! Reply *content* for a given [`pingu_protocol::reflex::cpuid::CpuIdentity`] lives in the
 //! safe core (`protocol/cpuid.rs`); this file owns the trap itself and the
 //! process-local decisions about which identity applies to which caller.
 use core::arch::x86_64::__cpuid_count;
@@ -15,70 +15,18 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 use crate::maps;
 use crate::procmem::read_memory;
 use libc::{greg_t, siginfo_t, ucontext_t};
-use pingu_protocol::cpuid::{
-    ActiveCpuIdentity, CpuPresentation, Registers, Vendor, is_wine_system_rip, proton_avx_enabled,
-    variant2_amd_reply, variant2_intel_reply, with_intel_leaf7_features,
+use pingu_protocol::cpuid::{Registers, Vendor, is_wine_system_rip};
+use pingu_protocol::reflex::cpuid::{
+    ActiveCpuIdentity, CpuPresentation, artifact_amd_reply, artifact_intel_reply,
+    proton_avx_enabled,
 };
-use pingu_protocol::kuser::Recipe;
+use pingu_protocol::reflex::kuser::Recipe;
 
 const ARCH_SET_CPUID: c_int = 0x1012;
 const REFLEX_CPUID_CONSUMED: c_int = 1;
-const REFLEX_CPUID_KUSER_SPOOF_READY: c_int = 2;
 static ACTIVE_IDENTITY: ActiveCpuIdentity = ActiveCpuIdentity::new();
 static REFLEX64_PRESENTATION_SELECTED: AtomicBool = AtomicBool::new(false);
 static ARTIFACT_PROFILE_SELECTED: AtomicBool = AtomicBool::new(false);
-
-#[cfg(all(feature = "reflex", feature = "syscall", feature = "kuser"))]
-static ARTIFACT_SESSION: pingu_protocol::artifact::Session =
-    pingu_protocol::artifact::Session::new();
-
-#[cfg(all(feature = "reflex", feature = "syscall", feature = "kuser"))]
-static ARTIFACT_HANDLER: AtomicU64 = AtomicU64::new(0);
-#[cfg(all(feature = "reflex", feature = "syscall", feature = "kuser"))]
-static ARTIFACT_VARIANT1: AtomicBool = AtomicBool::new(false);
-
-/// Artifact variant 1: the registered handler uses the `0x1337` bypass marker
-/// of the older hypervisor sources (Anno 117, F1 25).
-#[cfg(all(feature = "reflex", feature = "syscall", feature = "kuser"))]
-pub(crate) fn artifact_variant1() -> bool {
-    ARTIFACT_VARIANT1.load(Ordering::Acquire)
-}
-
-/// Artifact variant 3 (`PINGU_ARTIFACT_VARIANT=3`): variant 2's protocol, but
-/// CPUID and the KUSER page use the hidden-feature presentation (FM27's
-/// November SimpleSvm).
-#[cfg(all(feature = "reflex", feature = "syscall", feature = "kuser"))]
-pub(crate) fn artifact_variant3() -> bool {
-    crate::config::artifact_variant3_forced()
-}
-
-#[cfg(all(feature = "reflex", feature = "syscall", feature = "kuser"))]
-fn learn_artifact_variant() {
-    if artifact_variant1() {
-        return;
-    }
-    let handler = ARTIFACT_HANDLER.load(Ordering::Acquire);
-    let mut code = [0u8; 0x200];
-    let Some(length) = [code.len(), 0x100, 0x80]
-        .into_iter()
-        .find(|&length| crate::procmem::read_memory(handler, &mut code[..length]))
-    else {
-        return;
-    };
-    if pingu_protocol::artifact::handler_bypass_magic(&code[..length])
-        == Some(pingu_protocol::artifact::VARIANT1_SYSCALL_BYPASS_MAGIC)
-    {
-        ARTIFACT_VARIANT1.store(true, Ordering::Release);
-        unsafe { debug_log(c"Artifact variant 1 detected (0x1337 bypass)".as_ptr()) };
-    }
-}
-
-#[cfg(all(feature = "reflex", feature = "syscall", feature = "kuser"))]
-pub(crate) fn artifact_protocol_active() -> bool {
-    crate::config::artifact_protocol_enabled()
-        && matches!(ACTIVE_IDENTITY.load().vendor(), Vendor::Amd | Vendor::Intel)
-        && ARTIFACT_PROFILE_SELECTED.load(Ordering::Acquire)
-}
 /// Set once Reflex's registration leaf (`0x336933`, the same handshake the
 /// pre-Rust runtime called "arm") has fired at least once, for either the
 /// legacy or modern protocol — both set the resume handler from this leaf,
@@ -92,12 +40,7 @@ pub(crate) fn artifact_protocol_active() -> bool {
 /// genuinely isn't Reflex64/Artifact would otherwise re-run that same
 /// expensive search forever, for the rest of the session.
 static PROTOCOL_ESTABLISHED: AtomicBool = AtomicBool::new(false);
-#[cfg(all(
-    feature = "debug",
-    feature = "environment",
-    feature = "hooks",
-    feature = "kuser"
-))]
+#[cfg(feature = "debug")]
 static FORWARDED_GAME_FAULTS_LOGGED: AtomicU64 = AtomicU64::new(0);
 
 const CALLER_CACHE_CAP: usize = 64;
@@ -190,12 +133,7 @@ static CALLER_CACHE: CallerCache = CallerCache::new();
 
 unsafe extern "C" {
     fn debug_log(message: *const c_char);
-    #[cfg(all(
-        feature = "debug",
-        feature = "environment",
-        feature = "hooks",
-        feature = "kuser"
-    ))]
+    #[cfg(feature = "debug")]
     fn debug_log_hex(prefix: *const c_char, value: u64);
     fn forward_signal(sig: c_int, info: *mut siginfo_t, context: *mut c_void);
     fn reflex_handle_cpuid(leaf: u32, rcx: u64, rdx: u64) -> c_int;
@@ -203,10 +141,7 @@ unsafe extern "C" {
 }
 
 fn is_identity_leaf(leaf: u32) -> bool {
-    matches!(
-        leaf,
-        0 | 1 | 0x4000_0000..=0x4000_0001 | 0x8000_0000..=0x8000_0004
-    )
+    matches!(leaf, 1 | 0x4000_0000..=0x4000_0001 | 0x8000_0002..=0x8000_0004)
 }
 
 fn little_endian_u16(bytes: &[u8]) -> Option<u16> {
@@ -320,17 +255,8 @@ const ARTIFACT_RESCAN_INTERVAL_MS: u64 = 1000;
 static ARTIFACT_SCAN_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
 static ARTIFACT_SCAN_MILLISECONDS: AtomicU64 = AtomicU64::new(0);
 
-fn mapping_generation() -> Option<u64> {
-    #[cfg(all(feature = "syscall", feature = "kuser", feature = "environment"))]
-    return Some(maps::file_mapping_generation());
-    #[cfg(not(all(feature = "syscall", feature = "kuser", feature = "environment")))]
-    None
-}
-
 fn artifact_module_newly_mapped() -> bool {
-    let Some(generation) = mapping_generation() else {
-        return artifact_module_mapped();
-    };
+    let generation = maps::file_mapping_generation();
     let now = crate::clock::coarse_milliseconds();
     if generation == ARTIFACT_SCAN_GENERATION.load(Ordering::Relaxed)
         && now.wrapping_sub(ARTIFACT_SCAN_MILLISECONDS.load(Ordering::Relaxed))
@@ -378,7 +304,7 @@ fn classify_caller(address: u64) -> Option<CallerKind> {
 }
 
 fn select_caller_presentation(leaf: u32, rip: u64) -> CallerKind {
-    if !is_identity_leaf(leaf) && !matches!(leaf, 0x1337 | 0x0033_6933) {
+    if !is_identity_leaf(leaf) {
         return CallerKind::Ordinary;
     }
     let kind = classify_caller(rip).unwrap_or(CallerKind::Ordinary);
@@ -468,10 +394,10 @@ impl NativeCache {
 
 static NATIVE_CACHE: NativeCache = NativeCache::new();
 
-fn artifact_reply(vendor: Vendor, leaf: u32, subleaf: u32) -> Option<Registers> {
+fn artifact_reply(vendor: Vendor, leaf: u32) -> Option<Registers> {
     match vendor {
-        Vendor::Intel => variant2_intel_reply(leaf, subleaf),
-        Vendor::Amd => variant2_amd_reply(leaf, subleaf),
+        Vendor::Intel => artifact_intel_reply(leaf),
+        Vendor::Amd => artifact_amd_reply(leaf),
         Vendor::Unknown => None,
     }
 }
@@ -481,14 +407,13 @@ fn with_native_apic_id(mut reply: Registers, native_ebx: u32) -> Registers {
     reply
 }
 
-fn detect_artifact_profile(leaf: u32, rip: Option<u64>) -> bool {
+fn fixed_reply(leaf: u32, rip: Option<u64>) -> Option<Registers> {
     let caller = rip
         .map(|rip| select_caller_presentation(leaf, rip))
         .unwrap_or(CallerKind::Ordinary);
     let vendor = ACTIVE_IDENTITY.load().vendor();
-    if matches!(vendor, Vendor::Intel | Vendor::Amd)
-        && (is_identity_leaf(leaf) || matches!(leaf, 0x1337 | 0x0033_6933))
-    {
+    let artifact_leaf = artifact_reply(vendor, leaf);
+    if artifact_leaf.is_some() {
         let artifact_present = caller == CallerKind::Artifact
             || ARTIFACT_PROFILE_SELECTED.load(Ordering::Acquire)
             || artifact_module_newly_mapped();
@@ -509,35 +434,15 @@ fn detect_artifact_profile(leaf: u32, rip: Option<u64>) -> bool {
             }
         }
     }
-    ARTIFACT_PROFILE_SELECTED.load(Ordering::Acquire)
-        && matches!(vendor, Vendor::Intel | Vendor::Amd)
-}
-
-fn fixed_reply(leaf: u32, subleaf: u32, rip: Option<u64>) -> Option<Registers> {
-    let artifact_profile = detect_artifact_profile(leaf, rip);
-    let vendor = ACTIVE_IDENTITY.load().vendor();
+    let artifact_profile = ARTIFACT_PROFILE_SELECTED.load(Ordering::Acquire)
+        && matches!(vendor, Vendor::Intel | Vendor::Amd);
     let mut reply = if artifact_profile {
-        let identity = ACTIVE_IDENTITY.load();
-        if identity.presentation() == CpuPresentation::Denuvo && leaf == 0 {
-            let native = native_reply(0, subleaf);
-            match vendor {
-                Vendor::Intel => Registers::new(native.eax, native.ebx, native.ecx, native.edx),
-                _ => artifact_reply(vendor, leaf, subleaf)?,
-            }
-        } else {
-            artifact_reply(vendor, leaf, subleaf)?
-        }
+        artifact_leaf.or_else(|| ACTIVE_IDENTITY.fixed_reply(leaf))?
     } else {
         ACTIVE_IDENTITY.fixed_reply(leaf)?
     };
     if artifact_profile && leaf == 1 {
         reply = with_native_apic_id(reply, native_reply(1, 0).ebx);
-    }
-    if artifact_profile && vendor == Vendor::Intel && leaf == 7 && subleaf == 0 {
-        reply = with_intel_leaf7_features(native_reply(7, 0));
-    }
-    if artifact_profile && leaf == 1 {
-        reply.ecx |= 1 << 31;
     }
     if !artifact_profile && leaf == 1 && unsafe { reflex_resume_identity_unarmed() } != 0 {
         reply.ecx |= 1 << 31;
@@ -547,21 +452,10 @@ fn fixed_reply(leaf: u32, subleaf: u32, rip: Option<u64>) -> Option<Registers> {
 
 fn configure_identity(vendor: Vendor, avx_enabled: bool) {
     ACTIVE_IDENTITY.configure_host(vendor, avx_enabled);
-    if crate::config::legacy_profile_forced() {
+    if crate::reflex::config::legacy_profile_forced() {
         ACTIVE_IDENTITY.select_legacy_presentation();
         unsafe { debug_log(c"cpuid presentation selected: legacy override".as_ptr()) };
     }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn cpuid_disable_faulting() {
-    let _ = unsafe {
-        libc::syscall(
-            libc::SYS_arch_prctl,
-            ARCH_SET_CPUID as libc::c_long,
-            1 as libc::c_ulong,
-        )
-    };
 }
 
 #[unsafe(no_mangle)]
@@ -583,13 +477,6 @@ pub extern "C" fn cpuid_activate_legacy_profile() {
 #[unsafe(no_mangle)]
 pub extern "C" fn cpuid_kuser_recipe() -> c_int {
     let identity = ACTIVE_IDENTITY.load();
-    if ARTIFACT_PROFILE_SELECTED.load(Ordering::Acquire) {
-        match identity.vendor() {
-            Vendor::Intel => return Recipe::Variant2Intel as c_int,
-            Vendor::Amd => return Recipe::Variant2Amd as c_int,
-            Vendor::Unknown => {}
-        }
-    }
     match (identity.presentation(), identity.vendor()) {
         (CpuPresentation::Legacy, Vendor::Intel) => Recipe::Dispatch as c_int,
         (CpuPresentation::Legacy, Vendor::Amd | Vendor::Unknown) => Recipe::Selector as c_int,
@@ -602,13 +489,12 @@ pub unsafe extern "C" fn cpuid_get_fixed_reply(leaf: u32, result: *mut Registers
     if result.is_null() {
         return 0;
     }
-    let reply = fixed_reply(leaf, 0, None);
+    let reply = fixed_reply(leaf, None);
     unsafe { result.write(reply.unwrap_or_default()) };
     c_int::from(reply.is_some())
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn detect_cpu_vendor() {
+pub(crate) unsafe extern "C" fn detect_cpu_vendor() {
     let vendor = Vendor::from_leaf0(native_cpuid(0, 0));
     let value = unsafe { libc::getenv(c"PROTON_AVX".as_ptr()) };
     let avx = if value.is_null() {
@@ -639,12 +525,7 @@ fn is_cpuid_instruction_at(address: usize) -> bool {
     read_memory(address as u64, &mut instruction) && instruction == [0x0f, 0xa2]
 }
 
-#[cfg(all(
-    feature = "debug",
-    feature = "environment",
-    feature = "hooks",
-    feature = "kuser"
-))]
+#[cfg(feature = "debug")]
 fn trace_forwarded_game_fault(info: *const siginfo_t, gregs: *const greg_t) {
     if !crate::environment::game_process()
         || FORWARDED_GAME_FAULTS_LOGGED.fetch_add(1, Ordering::Relaxed) >= 8
@@ -679,7 +560,7 @@ fn trace_forwarded_game_fault(info: *const siginfo_t, gregs: *const greg_t) {
 }
 
 fn leaf_varies_per_core(leaf: u32) -> bool {
-    matches!(leaf, 1 | 0xb | 0x1f | 0x8000_001e)
+    leaf == 0xb || leaf == 0x1f
 }
 
 fn native_reply(leaf: u32, subleaf: u32) -> Registers {
@@ -720,8 +601,7 @@ fn native_reply(leaf: u32, subleaf: u32) -> Registers {
     result
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn cpuid_sigsegv_handler(
+pub(crate) unsafe extern "C" fn cpuid_sigsegv_handler(
     sig: c_int,
     info: *mut siginfo_t,
     context: *mut c_void,
@@ -737,22 +617,16 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
     // `int 2e` is identifiable from its faulting opcode and #GP trap number.
     // Handle it before the CPUID-specific si_code check; that condition is
     // not needed to identify a guest `int 2e` instruction.
-    #[cfg(feature = "kuser")]
-    if unsafe { crate::syscall::skip_int2e_fault(context_ptr) } {
+    if unsafe { crate::int2e::skip_int2e_fault(context_ptr) } {
         return;
     }
     let is_cpuid_fault = unsafe {
         gregs.add(libc::REG_TRAPNO as usize).read() == 13 && (*info).si_code == libc::SI_KERNEL
     };
     if !is_cpuid_fault {
-        #[cfg(all(
-            feature = "debug",
-            feature = "environment",
-            feature = "hooks",
-            feature = "kuser"
-        ))]
+        #[cfg(feature = "debug")]
         trace_forwarded_game_fault(info, gregs);
-        #[cfg(all(feature = "debug", feature = "environment", feature = "hooks"))]
+        #[cfg(feature = "debug")]
         {
             // SAFETY: `info` and `context_ptr` were checked non-null above and
             // are the live signal frame supplied by the kernel.
@@ -763,7 +637,7 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
             // SAFETY: gettid has no pointer arguments and is safe to issue in
             // this signal handler.
             let tid = unsafe { libc::gettid() as u64 };
-            crate::syscall::trace_null_fault(address, fault_rip, tid);
+            crate::reflex::syscall::trace_null_fault(address, fault_rip, tid);
         }
         unsafe { forward_signal(sig, info, context) };
         return;
@@ -771,12 +645,7 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
 
     let rip = unsafe { gregs.add(libc::REG_RIP as usize).read() };
     if !is_cpuid_instruction_at(rip as usize) {
-        #[cfg(all(
-            feature = "debug",
-            feature = "environment",
-            feature = "hooks",
-            feature = "kuser"
-        ))]
+        #[cfg(feature = "debug")]
         trace_forwarded_game_fault(info, gregs);
         unsafe { forward_signal(sig, info, context) };
         return;
@@ -789,68 +658,25 @@ pub unsafe extern "C" fn cpuid_sigsegv_handler(
             gregs.add(libc::REG_RDX as usize).read() as u64,
         )
     };
-    #[cfg(all(feature = "syscall", feature = "kuser", feature = "reflex"))]
-    if (!is_wine_system_rip(rip as u64) || ARTIFACT_SESSION.pid() != 0)
-        && crate::config::artifact_protocol_enabled()
-        && matches!(ACTIVE_IDENTITY.load().vendor(), Vendor::Amd | Vendor::Intel)
-    {
-        // Discover Artifact using the existing image boundary. Once its PID
-        // is registered, the hypervisor identity (SimpleSvm on AMD, HyperDbg
-        // on Intel) applies to all user-mode callers in that process,
-        // including calls from Wine's Windows system DLLs.
-        // Further caller classification cannot change this process-wide
-        // profile. Avoid a discarded legacy reply and /proc/self/maps scan
-        // on each new protected-code call site after selection.
-        if !artifact_protocol_active() {
-            let _ = fixed_reply(leaf, control as u32, Some(rip as u64));
-        }
-        if artifact_protocol_active() {
-            #[cfg(all(
-                feature = "cpuid",
-                feature = "hooks",
-                feature = "reflex",
-                feature = "syscall",
-                feature = "kuser"
-            ))]
-            crate::artifact::before_cpuid(leaf);
-            let reply = unsafe { artifact_protocol_cpuid(leaf, control, payload, gregs) };
-            if let Some(reply) = reply {
-                unsafe { write_cpuid_reply(gregs, rip, reply) };
-            } else {
-                // The ready path updates only RAX, exactly as SimpleSvm does.
-                unsafe { gregs.add(libc::REG_RIP as usize).write(rip.wrapping_add(2)) };
-            }
-            return;
-        }
-    }
-    #[cfg(all(feature = "syscall", feature = "kuser", feature = "reflex"))]
     if leaf == 0x0033_6933 {
-        crate::syscall::register_reflex_dispatch_handler(control);
+        crate::reflex::syscall::register_reflex_dispatch_handler(control);
         PROTOCOL_ESTABLISHED.store(true, Ordering::Release);
     }
     let reply = if is_wine_system_rip(rip as u64) {
         native_reply(leaf, control as u32)
     } else {
-        if matches!(leaf, 0x1337 | 0x0033_6933) {
-            let _ = detect_artifact_profile(leaf, Some(rip as u64));
-        }
-        #[cfg(all(feature = "syscall", feature = "kuser", feature = "reflex"))]
-        if leaf == 0x0033_6933 {
-            crate::syscall::register_reflex_dispatch_handler(control);
-            PROTOCOL_ESTABLISHED.store(true, Ordering::Release);
-        }
-        match unsafe { reflex_handle_cpuid(leaf, control, payload) } {
-            REFLEX_CPUID_CONSUMED => Registers::default(),
-            REFLEX_CPUID_KUSER_SPOOF_READY => Registers::new(1, 0, 0, 0),
-            _ => fixed_reply(leaf, control as u32, Some(rip as u64))
-                .unwrap_or_else(|| native_reply(leaf, control as u32)),
+        match fixed_reply(leaf, Some(rip as u64)) {
+            Some(reply) => reply,
+            None => {
+                if unsafe { reflex_handle_cpuid(leaf, control, payload) } == REFLEX_CPUID_CONSUMED {
+                    Registers::default()
+                } else {
+                    native_reply(leaf, control as u32)
+                }
+            }
         }
     };
 
-    unsafe { write_cpuid_reply(gregs, rip, reply) };
-}
-
-unsafe fn write_cpuid_reply(gregs: *mut greg_t, rip: greg_t, reply: Registers) {
     unsafe {
         gregs
             .add(libc::REG_RAX as usize)
@@ -866,108 +692,6 @@ unsafe fn write_cpuid_reply(gregs: *mut greg_t, rip: greg_t, reply: Registers) {
             .write(i64::from(reply.edx));
         gregs.add(libc::REG_RIP as usize).write(rip.wrapping_add(2));
     }
-}
-
-#[cfg(all(feature = "syscall", feature = "kuser", feature = "reflex"))]
-unsafe fn artifact_protocol_cpuid(
-    leaf: u32,
-    control: u64,
-    payload: u64,
-    gregs: *mut greg_t,
-) -> Option<Registers> {
-    use pingu_protocol::artifact::{KUSER_READY, REGISTER_HANDLER, REGISTER_PROCESS};
-    let vendor = ACTIVE_IDENTITY.load().vendor();
-    match leaf {
-        REGISTER_PROCESS => {
-            ARTIFACT_SESSION.register(payload);
-            learn_artifact_variant();
-            unsafe {
-                debug_log(
-                    match vendor {
-                        Vendor::Intel => c"Artifact process registered (Intel)",
-                        _ => c"Artifact process registered (AMD)",
-                    }
-                    .as_ptr(),
-                )
-            };
-            // A repeated registration after the handler exists must also
-            // retain Reflex's process identity for direct-syscall routing.
-            if PROTOCOL_ESTABLISHED.load(Ordering::Acquire) {
-                unsafe { reflex_handle_cpuid(leaf, control, ARTIFACT_SESSION.pid()) };
-            }
-        }
-        REGISTER_HANDLER => {
-            ARTIFACT_HANDLER.store(control, Ordering::Release);
-            learn_artifact_variant();
-            crate::syscall::register_reflex_dispatch_handler(control);
-            unsafe { reflex_handle_cpuid(leaf, control, payload) };
-            PROTOCOL_ESTABLISHED.store(true, Ordering::Release);
-            let pid = ARTIFACT_SESSION.pid();
-            if pid != 0 {
-                unsafe { reflex_handle_cpuid(REGISTER_PROCESS, 0, pid) };
-            }
-        }
-        KUSER_READY
-            if ARTIFACT_SESSION.take_ready(|| unsafe {
-                let recipe = match vendor {
-                    _ if artifact_variant3() => Recipe::Variant3,
-                    _ if artifact_variant1() => Recipe::Variant1,
-                    Vendor::Intel => Recipe::Variant2Intel,
-                    _ => Recipe::Variant2Amd,
-                };
-                crate::kuser::patch_kuser_shared_data_recipe(recipe as c_int) == 0
-            }) =>
-        {
-            unsafe {
-                gregs.add(libc::REG_RAX as usize).write(1);
-                debug_log(
-                    match vendor {
-                        Vendor::Intel => c"Artifact KUSER ready acknowledged (Intel)",
-                        _ => c"Artifact KUSER ready acknowledged (AMD)",
-                    }
-                    .as_ptr(),
-                );
-            }
-            return None;
-        }
-        _ => {}
-    }
-    if ARTIFACT_SESSION.pid() != 0 {
-        // Variant 3 answers like the November SimpleSvm (hidden features,
-        // but a signed hypervisor leaf).
-        if artifact_variant3() && vendor == Vendor::Amd {
-            let native_ebx = if leaf == 1 { native_reply(1, 0).ebx } else { 0 };
-            return Some(
-                pingu_protocol::artifact::variant3_reply(leaf, native_ebx)
-                    .unwrap_or_else(|| native_reply(leaf, control as u32)),
-            );
-        }
-        // Variant 1 answers with the hidden-feature replies: only leaf 1 and
-        // the brand string are spoofed, every other leaf stays native.
-        if artifact_variant1() {
-            let native_ebx = if leaf == 1 { native_reply(1, 0).ebx } else { 0 };
-            return Some(
-                pingu_protocol::artifact::variant1_reply(vendor, leaf, native_ebx)
-                    .unwrap_or_else(|| native_reply(leaf, control as u32)),
-            );
-        }
-        let reply = match vendor {
-            Vendor::Intel => variant2_intel_reply(leaf, control as u32),
-            _ => pingu_protocol::artifact::session_amd_reply(leaf, control as u32),
-        };
-        if let Some(mut reply) = reply {
-            if leaf == 1 {
-                reply = with_native_apic_id(reply, native_reply(1, 0).ebx);
-            }
-            // The Intel profile merges native leaf 7 subleaf 0 feature bits,
-            // exactly as the non-session fixed_reply path does.
-            if vendor == Vendor::Intel && leaf == 7 && control as u32 == 0 {
-                reply = with_intel_leaf7_features(native_reply(7, 0));
-            }
-            return Some(reply);
-        }
-    }
-    Some(native_reply(leaf, control as u32))
 }
 
 #[cfg(test)]
@@ -1083,49 +807,49 @@ mod protocol_established_tests {
 #[cfg(test)]
 mod artifact_profile_tests {
     use super::{artifact_reply, with_native_apic_id};
-    use pingu_protocol::cpuid::{CpuIdentity, Registers, Vendor};
+    use pingu_protocol::cpuid::{Registers, Vendor};
+    use pingu_protocol::reflex::cpuid::CpuIdentity;
 
     #[test]
     fn selects_artifact_reply_by_host_vendor() {
         assert_eq!(
-            artifact_reply(Vendor::Intel, 1, 0),
+            artifact_reply(Vendor::Intel, 1),
             Some(Registers::new(
-                0x000d_0670,
-                0x0010_0800,
-                0x7ffa_fbff,
+                0x000a_0655,
+                0x0020_0800,
+                0x01fa_ebff,
                 0xbfeb_fbff,
             ))
         );
         assert_eq!(
-            artifact_reply(Vendor::Amd, 1, 0),
+            artifact_reply(Vendor::Amd, 1),
             Some(Registers::new(
                 0x00a2_0f12,
                 0x0010_0800,
-                0x7ef8_320b,
+                0x00f8_220b,
                 0x178b_fbff,
             ))
         );
-        assert_eq!(artifact_reply(Vendor::Unknown, 1, 0), None);
-        assert_eq!(artifact_reply(Vendor::Intel, 0xb, 0), None);
-        assert_eq!(artifact_reply(Vendor::Amd, 0x8000_001e, 0), None);
+        assert_eq!(artifact_reply(Vendor::Unknown, 1), None);
+        assert_eq!(artifact_reply(Vendor::Intel, 7), None);
         assert_ne!(
-            artifact_reply(Vendor::Intel, 1, 0),
+            artifact_reply(Vendor::Intel, 1),
             CpuIdentity::denuvo(Vendor::Intel, true).fixed_reply(1),
-            "Artifact Intel profile uses its own processor signature and feature mask"
+            "Artifact must clear AVX features even when PROTON_AVX=1"
         );
     }
 
     #[test]
     fn artifact_leaf_one_preserves_native_apic_id() {
-        let reply = artifact_reply(Vendor::Intel, 1, 0).unwrap();
+        let reply = artifact_reply(Vendor::Intel, 1).unwrap();
         assert_eq!(
             with_native_apic_id(reply, 0xabcd_ef01),
-            Registers::new(0x000d_0670, 0xab10_0800, 0x7ffa_fbff, 0xbfeb_fbff)
+            Registers::new(0x000a_0655, 0xab20_0800, 0x01fa_ebff, 0xbfeb_fbff)
         );
     }
 }
 
-#[cfg(all(test, feature = "kuser", not(miri)))]
+#[cfg(all(test, not(miri)))]
 mod int2e_signal_tests {
     use super::cpuid_sigsegv_handler;
     use core::mem::MaybeUninit;

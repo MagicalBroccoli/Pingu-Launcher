@@ -1,19 +1,12 @@
 //! The one `/proc/self/maps` reader. It uses a raw `read` syscall, so it is
 //! safe inside the SIGSEGV/SIGSYS handlers and never re-enters this library's
 //! own exported `read` interposer.
-#[cfg(all(
-    feature = "cpuid",
-    feature = "syscall",
-    feature = "kuser",
-    feature = "environment"
-))]
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const LINE_CAPACITY: usize = 1024;
 
 /// One parsed `/proc/self/maps` line. `path` is everything after the inode,
 /// spaces included (Steam library paths often contain them).
-#[cfg_attr(not(feature = "kuser"), allow(dead_code))]
 pub(crate) struct Mapping<'a> {
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -132,33 +125,15 @@ pub(crate) fn find_line(mut visit: impl FnMut(&[u8]) -> bool) -> bool {
 /// Counts file-backed mappings made through this library's `mmap`
 /// interposer, so a caller can skip rescanning `/proc/self/maps` when no new
 /// file can have appeared in it since its last look.
-#[cfg(all(
-    feature = "cpuid",
-    feature = "syscall",
-    feature = "kuser",
-    feature = "environment"
-))]
 static FILE_MAPPINGS: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(all(
-    feature = "cpuid",
-    feature = "syscall",
-    feature = "kuser",
-    feature = "environment"
-))]
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn note_file_mapping() {
-    FILE_MAPPINGS.fetch_add(1, Ordering::Relaxed);
+    FILE_MAPPINGS.fetch_add(1, Ordering::Release);
 }
 
-#[cfg(all(
-    feature = "cpuid",
-    feature = "syscall",
-    feature = "kuser",
-    feature = "environment"
-))]
 pub(crate) fn file_mapping_generation() -> u64 {
-    FILE_MAPPINGS.load(Ordering::Relaxed)
+    FILE_MAPPINGS.load(Ordering::Acquire)
 }
 
 #[cfg(test)]

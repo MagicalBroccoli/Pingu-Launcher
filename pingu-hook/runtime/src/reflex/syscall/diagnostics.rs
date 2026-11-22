@@ -15,10 +15,8 @@ const NULL_FAULT_DUMP_LIMIT: u64 = 4;
 #[derive(Clone, Copy)]
 pub(super) enum Disposition {
     Forwarded = 0,
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
     BridgeReplayRestored = 1,
     ReflexBypassForwarded = 2,
-    #[cfg(all(feature = "kuser", feature = "reflex"))]
     LocallyCompleted = 3,
     ReflexRouteDeclined = 4,
     ReflexRedirected = 5,

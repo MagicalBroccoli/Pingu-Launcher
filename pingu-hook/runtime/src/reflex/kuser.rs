@@ -5,7 +5,7 @@
 use core::ffi::{CStr, c_char, c_int};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
-use pingu_protocol::kuser::{PAGE_SIZE, PatchError, PatchState, Recipe};
+use pingu_protocol::reflex::kuser::{PAGE_SIZE, PatchError, PatchState, Recipe};
 
 const ADDRESS: usize = 0x7ffe_0000;
 /// `KUSER_SHARED_DATA.SystemCall`: nonzero routes Wine's ntdll syscall
@@ -29,7 +29,6 @@ pub(crate) fn recover_patch_after_fork() {
     PATCH_STATE.recover_after_fork();
 }
 
-#[path = "shared_time.rs"]
 mod shared_time;
 
 pub(crate) fn prepare_shared_page() {
@@ -117,15 +116,9 @@ fn syscall_hack_enabled() -> bool {
     if !SYSCALL_HACK_ENABLED.load(Ordering::Acquire) {
         return false;
     }
-    #[cfg(feature = "environment")]
-    {
-        crate::environment::game_process()
-    }
-    #[cfg(not(feature = "environment"))]
-    true
+    crate::environment::game_process()
 }
 
-#[cfg(feature = "hooks")]
 pub(crate) fn force_direct_syscall() {
     if !syscall_hack_enabled()
         || SYSCALL_HACK_APPLIED.load(Ordering::Acquire)
@@ -173,8 +166,7 @@ pub unsafe extern "C" fn patch_kuser_shared_data_recipe(recipe: c_int) -> c_int 
         },
     );
     drop(_guard);
-    #[cfg(all(feature = "syscall", feature = "reflex"))]
-    if result.is_ok() && !crate::syscall::install_wine_syscall_dispatcher_bridge() {
+    if result.is_ok() && !crate::reflex::syscall::install_wine_syscall_dispatcher_bridge() {
         log(c"failed to install Wine syscall dispatcher bridge");
         return -1;
     }
@@ -195,6 +187,9 @@ pub unsafe extern "C" fn patch_kuser_shared_data() -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pingu_setup_kuser() {
+    if !crate::path::is_reflex() {
+        return;
+    }
     let avx = unsafe {
         let avx_value = libc::getenv(c"PROTON_AVX".as_ptr());
         !avx_value.is_null() && CStr::from_ptr(avx_value).to_bytes() == b"1"
@@ -211,14 +206,8 @@ pub unsafe extern "C" fn pingu_setup_kuser() {
     // Install before Reflex loads in the game process so its initial IAT
     // protection writes are visible to the bridge. The KUSER patch handshake
     // retries installation later if Wine has not populated its dispatcher yet.
-    #[cfg(all(
-        feature = "syscall",
-        feature = "reflex",
-        feature = "environment",
-        feature = "hooks"
-    ))]
     if crate::environment::game_process() {
-        let _ = crate::syscall::install_wine_syscall_dispatcher_bridge();
+        let _ = crate::reflex::syscall::install_wine_syscall_dispatcher_bridge();
     }
 }
 

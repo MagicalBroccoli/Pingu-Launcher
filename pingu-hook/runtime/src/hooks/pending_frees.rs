@@ -185,7 +185,11 @@ mod tests {
         let mut indexed = History::new();
         let mut reference = Reference::new();
         let mut random = 0x91a2_b3c4_d5e6_f701u64;
-        for step in 0..20_000 {
+        // Under Miri's interpreter, 20,000 steps of O(CAPACITY) reference scans
+        // take >30 minutes; 2,500 steps still wrap CAPACITY (~1,667 inserts) to
+        // cover collisions, reuse, and eviction.
+        const STEPS: usize = if cfg!(miri) { 2_500 } else { 20_000 };
+        for step in 0..STEPS {
             random ^= random << 13;
             random ^= random >> 7;
             random ^= random << 17;

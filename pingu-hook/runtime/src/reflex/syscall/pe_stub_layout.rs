@@ -178,8 +178,7 @@ fn resolve(slot: &AtomicPtr<c_void>, name: &core::ffi::CStr) -> *mut c_void {
 /// test that calls `libc::read` directly (harmless at runtime, since it
 /// forwards through, but an unresolvable symbol clash under Miri).
 #[cfg(not(test))]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize {
+pub(crate) unsafe extern "C" fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize {
     let real = {
         let _errno = crate::errno::Errno::save();
         resolve(&REAL_READ, c"read")
@@ -206,8 +205,7 @@ pub unsafe extern "C" fn read(fd: c_int, buffer: *mut c_void, count: usize) -> i
 ///
 /// Excluded from test builds: see the same note on [`read`] above.
 #[cfg(not(test))]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn pread(
+pub(crate) unsafe extern "C" fn pread(
     fd: c_int,
     buffer: *mut c_void,
     count: usize,
@@ -251,7 +249,6 @@ unsafe fn after_file_read(fd: c_int, buffer: *mut c_void, result: isize) {
         return;
     }
     let _errno = crate::errno::Errno::save();
-    #[cfg(feature = "environment")]
     if !crate::environment::game_process() {
         return;
     }
@@ -290,8 +287,7 @@ unsafe fn after_file_read(fd: c_int, buffer: *mut c_void, result: isize) {
 /// just traded one Miri failure for another; removing the clash at its root
 /// (this export not existing in a test binary at all) is the actual fix.
 #[cfg(not(test))]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn mmap(
+pub(crate) unsafe extern "C" fn mmap(
     addr: *mut c_void,
     length: usize,
     prot: c_int,
@@ -321,7 +317,6 @@ pub unsafe extern "C" fn mmap(
         }
     };
     if result != libc::MAP_FAILED && fd >= 0 && flags & libc::MAP_ANONYMOUS == 0 {
-        #[cfg(feature = "cpuid")]
         crate::maps::note_file_mapping();
         #[cfg(feature = "debug")]
         unsafe {
@@ -434,7 +429,6 @@ unsafe fn after_image_map(
     offset: libc::off_t,
 ) {
     let _errno = crate::errno::Errno::save();
-    #[cfg(feature = "environment")]
     if !crate::environment::game_process() {
         return;
     }
@@ -510,7 +504,6 @@ unsafe fn after_file_map(
     real_mmap: *mut c_void,
 ) {
     let _errno = crate::errno::Errno::save();
-    #[cfg(feature = "environment")]
     if !crate::environment::game_process() {
         return;
     }
@@ -647,7 +640,6 @@ unsafe fn trace_system_dll_map(
     if unsafe { debug_enabled() } == 0 {
         return;
     }
-    #[cfg(feature = "environment")]
     if !crate::environment::game_process() {
         return;
     }
@@ -687,7 +679,6 @@ unsafe fn trace_system_dll_read(
     if unsafe { debug_enabled() } == 0 || length < 0x100 {
         return;
     }
-    #[cfg(feature = "environment")]
     if !crate::environment::game_process() {
         return;
     }

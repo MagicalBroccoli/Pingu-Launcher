@@ -2,9 +2,9 @@
 
 Reference table of how each supported title's Reflex client differs in CPU
 identity, `KUSER_SHARED_DATA` recipe, and dispatch protocol. This is the
-data behind `protocol/quirks.rs` (see `docs/ARCHITECTURE.md`) — when a new
+data behind `protocol/reflex/quirks.rs` (see `docs/ARCHITECTURE.md`) — when a new
 title needs a special case, it should extend this table (and the matching
-row in `protocol/quirks.rs`), not add an inline literal to dispatch code.
+row in `protocol/reflex/quirks.rs`), not add an inline literal to dispatch code.
 
 Titles covered: ACBFR, BGE, FC6, NFSPB, TopSpin, SMT5V, Hatsune Miku,
 LADPYIH. BL4 is working in current gameplay testing, but its protocol

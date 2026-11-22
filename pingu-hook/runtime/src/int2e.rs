@@ -58,14 +58,14 @@ static FALLBACK_SKIP_LOGGED: AtomicU64 = AtomicU64::new(0);
 unsafe extern "C" {
     fn debug_log_hex(prefix: *const core::ffi::c_char, value: u64);
 }
-#[cfg(all(feature = "debug", feature = "reflex"))]
+#[cfg(feature = "debug")]
 unsafe extern "C" {
     fn debug_log(message: *const core::ffi::c_char);
 }
 
 /// Capture the same window-list request before it enters our private syscall
 /// trampoline, so its arguments can be compared with the SIGSYS-side trace.
-#[cfg(all(feature = "debug", feature = "reflex"))]
+#[cfg(feature = "debug")]
 fn trace_window_list_entry(gregs: *const libc::greg_t) {
     static EVENTS: AtomicU64 = AtomicU64::new(0);
     let register = |index: libc::c_int| unsafe { gregs.add(index as usize).read() as u64 };
@@ -160,14 +160,14 @@ fn build_or_reuse_private_trampoline(index: usize, site: u64, next: u64) -> Opti
     {
         Ok(_) => Some(built),
         Err(existing) => {
-            unsafe { libc::munmap(built as *mut c_void, pingu_protocol::kuser::PAGE_SIZE) };
+            unsafe { libc::munmap(built as *mut c_void, pingu_protocol::PAGE_SIZE) };
             Some(existing)
         }
     }
 }
 
 fn build_private_trampoline(site: u64, next: u64) -> Option<u64> {
-    let page_size = pingu_protocol::kuser::PAGE_SIZE;
+    let page_size = pingu_protocol::PAGE_SIZE;
     let page = site & !(page_size as u64 - 1);
     executable_mapping_protection(page, page_size as u64)?;
     let _errno = crate::errno::Errno::save();
@@ -241,8 +241,10 @@ pub(crate) unsafe fn skip_int2e_fault(context: *mut ucontext_t) -> bool {
         return false;
     }
 
-    #[cfg(all(feature = "debug", feature = "reflex"))]
-    trace_window_list_entry(gregs);
+    #[cfg(feature = "debug")]
+    if crate::path::is_reflex() {
+        trace_window_list_entry(gregs);
+    }
 
     if let Some(syscall_rip) = preceding_direct_syscall(rip) {
         unsafe {
@@ -322,7 +324,7 @@ fn patch_to_syscall(address: u64) -> bool {
     if !read_memory(address, &mut original) || original != INT2E_INSTRUCTION {
         return false;
     }
-    let page_size = pingu_protocol::kuser::PAGE_SIZE as u64;
+    let page_size = pingu_protocol::PAGE_SIZE as u64;
     let page = address & !(page_size - 1);
     let Some(second_byte) = address.checked_add(1) else {
         return false;

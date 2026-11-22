@@ -212,17 +212,32 @@ reset or migrate your existing prefix.
 | `PINGU_RUNTIME_DIR` | Data directory instead of `~/.local/share/pingu-runtime` |
 | `PINGU_HOOK_VARIANT` | Use `variants/pingu-hook.<name>.so` of the data directory instead of the built-in library |
 
-The launcher sets `PINGU_ARTIFACT_PROTOCOL=1` in Artifact mode when XCR0 is or will be 7.
+The launcher sets `PINGU_HOOK_PATH=artifact` in Artifact mode when XCR0 is or will be 7.
 `pingu-hook` reads these variables itself (they work without the launcher):
 
 | Variable | Effect |
 |---|---|
-| `PINGU_ARTIFACT_PROTOCOL` | `1` enables the Artifact protocol and its loader adaptations; needs XCR0 = 7 |
-| `PINGU_ARTIFACT_VARIANT` | `3` selects Artifact variant 3 (November SimpleSvm presentation). Variant 1 (`0x1337` bypass, Anno 117, F1 25) is detected from the game's handler, variant 2 is the default |
-| `PINGU_LEGACY_PROFILE` | `1` forces the legacy CPU and KUSER presentation |
+| `PINGU_HOOK_PATH` | `reflex` (default) or `artifact` selects the compatibility path of the process and all its children. `reflex` is the Reflex/Denuvo protocol; `artifact` is the Artifact VBS 1.9/2.0 protocol and needs XCR0 = 7 |
 | `PINGU_DEBUG`, `PINGU_LOG` | Debug logging and its log file |
-| `PINGU_SYSCALL_HACK` | Legacy syscall routing (only TopSpin needs it) |
 | `PINGU_WIN32U_FREE_GUARD` | `1` works around a Wine `win32u` double free |
+
+Reflex path only:
+
+| Variable | Effect |
+|---|---|
+| `PINGU_LEGACY_PROFILE` | `1` forces the legacy CPU and KUSER presentation |
+| `PINGU_SYSCALL_HACK` | Legacy syscall routing (only TopSpin needs it) |
+
+Artifact path only:
+
+| Variable | Effect |
+|---|---|
+| `PINGU_VBS20` | `1` forces VBS 2.0 mode, `0` forces VBS 1.9; the mode is detected from the game's `artifact.dll` otherwise |
+| `PINGU_RESOLVER_BRIDGE` | `0` turns off the PE resolver bridge (diagnosis only, Artifact games need it) |
+| `PINGU_SYSCALL_LEAK_TRAP` | `0` turns off the guard against Windows syscalls that slip past Wine's syscall dispatch (diagnosis only) |
+
+On the Artifact path `pingu-hook` also sets `PROTON_DISABLE_LSTEAMCLIENT=1` unless it is already set. On
+hosts with more than 16 CPUs it limits Wine to 16 through `WINE_CPU_TOPOLOGY` (a value you set yourself wins).
 
 ## Update, Disable And Recover
 

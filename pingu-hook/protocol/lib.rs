@@ -1,12 +1,17 @@
 //! pingu-hook's safe protocol core: the pure, `no_std`, unsafe-forbidden
-//! decision logic for the Reflex/Denuvo compatibility protocol, with no
-//! knowledge of libc, signals, or process memory. `runtime/` is the unsafe
-//! FFI/signal-handling shell that drives this crate through the `Host`
-//! trait pattern (see `reflex::Host`) and calls its pure functions directly
-//! elsewhere (CPUID reply tables, KUSER patch recipes, environment/gamescope
-//! string parsing). See `docs/ARCHITECTURE.md` for how the two crates fit
-//! together, and `docs/protocol/syscall-routing.md` for the protocol this
-//! module implements.
+//! decision logic for the two compatibility paths, with no knowledge of libc,
+//! signals, or process memory. `runtime/` is the unsafe FFI/signal-handling
+//! shell that drives this crate.
+//!
+//! - [`reflex`]: the Reflex/Denuvo protocol (the `Host` trait pattern, CPUID
+//!   identities, KUSER patch recipes, per-title quirks).
+//! - [`artifact`]: the Artifact VBS 1.9/2.0 protocol (handshake, CPUID
+//!   profiles, KUSER identity writes).
+//! - The remaining modules are shared: path selection, CPUID register types,
+//!   debug line formatting, faketime offset math, Gamescope and Wine
+//!   environment string parsing.
+//!
+//! See `docs/ARCHITECTURE.md` for how the two crates fit together.
 #![forbid(unsafe_code)]
 #![no_std]
 
@@ -16,6 +21,8 @@ pub mod debug;
 pub mod environment;
 pub mod faketime;
 pub mod gamescope;
-pub mod kuser;
-pub mod quirks;
+pub mod path;
 pub mod reflex;
+
+/// The size of Windows' `KUSER_SHARED_DATA` page.
+pub const PAGE_SIZE: usize = 4096;

@@ -1,9 +1,18 @@
 //! pingu-hook's unsafe runtime shell: the libc/signal/syscall interposition
-//! that drives the safe `pingu_protocol` (`protocol/`) crate's decision logic. Each
-//! module here is feature-gated independently (see the `[features]` table
-//! in `Cargo.toml`) so `xtask` and CI can build and lint every supported
-//! subset; `docs/ARCHITECTURE.md` has the full module map and
-//! `docs/protocol/` has the protocol design each module implements.
+//! that drives the safe `pingu_protocol` (`protocol/`) crate's decision logic.
+//!
+//! The library carries two compatibility paths and picks one per process at
+//! load time from `PINGU_HOOK_PATH` (`reflex`, the default, or `artifact`):
+//!
+//! - [`reflex`]: the Reflex/Denuvo protocol.
+//! - [`artifact`]: the Artifact VBS 1.9/2.0 protocol.
+//!
+//! Everything else is shared by both: signal and allocator hooks, debug
+//! logging, Gamescope and Wine environment handling, faketime, `INT 2E`
+//! emulation and the `/proc` helpers. The libc symbols both paths interpose
+//! are exported once, from [`interpose`], and forwarded to the active path.
+//! See `docs/ARCHITECTURE.md` for the module map.
+//!
 //! Compiled to a static library and linked into `pingu-hook.so` by `xtask`,
 //! with the exported C ABI surface and linker hardening it verifies.
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -24,49 +33,21 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
 )))]
 compile_error!("pingu-hook-runtime requires Linux x86_64 with glibc and 64-bit pointers");
 
-#[cfg(all(
-    feature = "cpuid",
-    feature = "hooks",
-    feature = "reflex",
-    feature = "syscall",
-    feature = "kuser"
-))]
-mod artifact;
-#[cfg(any(feature = "cpuid", feature = "faketime"))]
 mod clock;
-#[cfg(any(feature = "cpuid", feature = "syscall"))]
-mod config;
-#[cfg(any(
-    feature = "cpuid",
-    feature = "syscall",
-    feature = "debug",
-    feature = "kuser"
-))]
 mod errno;
-#[cfg(any(feature = "cpuid", feature = "kuser"))]
+mod int2e;
 mod maps;
-#[cfg(feature = "kuser")]
 mod page_guard;
-#[cfg(any(feature = "cpuid", feature = "syscall"))]
 mod procmem;
 
-#[cfg(feature = "cpuid")]
-pub mod cpuid;
-#[cfg(feature = "debug")]
+pub mod artifact;
 pub mod debug;
-#[cfg(feature = "environment")]
 pub mod environment;
-#[cfg(feature = "faketime")]
 pub mod faketime;
-#[cfg(feature = "gamescope")]
 pub mod gamescope;
-#[cfg(feature = "hooks")]
 pub mod hooks;
-#[cfg(feature = "kuser")]
-pub mod kuser;
-#[cfg(feature = "reflex")]
+#[cfg(not(test))]
+pub mod interpose;
+pub mod path;
 pub mod reflex;
-#[cfg(feature = "environment")]
 pub mod registry;
-#[cfg(feature = "syscall")]
-pub mod syscall;

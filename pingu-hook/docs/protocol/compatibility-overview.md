@@ -24,7 +24,7 @@ for the other titles.
 
 ## Status of `PINGU_SYSCALL_HACK`
 
-**Still active in the shipped runtime** (`runtime/src/kuser.rs` writes
+**Still active in the shipped runtime** (`runtime/src/reflex/kuser.rs` writes
 `KUSER_SHARED_DATA.SystemCall = 0` for the game process when this is set).
 The target design — routing every title without touching that byte at all —
 is written up in [`syscall-routing.md`](syscall-routing.md), and is already

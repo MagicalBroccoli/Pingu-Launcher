@@ -1,7 +1,9 @@
 # Protocol design reference
 
 Permanent design and compatibility reference for the Reflex/Denuvo
-protocol pingu-hook implements. Where the code and these docs disagree, that's
+protocol pingu-hook implements (the `reflex` value of `PINGU_HOOK_PATH`; the
+`artifact` path is documented in the module headers under
+`runtime/src/artifact/`). Where the code and these docs disagree, that's
 a bug in one of them — fix the discrepancy rather than trusting whichever
 was written more recently.
 
@@ -11,7 +13,7 @@ was written more recently.
 - [`syscall-routing.md`](syscall-routing.md) — the target design for syscall
   routing: goal, invariants, and the three routing boundaries in source.
 - [`game-quirks.md`](game-quirks.md) — per-title CPU identity / KUSER
-  recipe / dispatch protocol differences, backing `protocol/quirks.rs`.
+  recipe / dispatch protocol differences, backing `protocol/reflex/quirks.rs`.
 - [`topspin-investigation.md`](topspin-investigation.md) — the one open
   compatibility issue currently gating full `PINGU_SYSCALL_HACK` removal.
 - [`umip.md`](umip.md) — the unprivileged SGDT interception primitive and

@@ -2,23 +2,22 @@
 //! `process_vm_readv`/`process_vm_writev`, so probing an address that may not
 //! be mapped fails a syscall instead of faulting. Safe to use from the
 //! SIGSEGV/SIGSYS handlers.
-#![cfg_attr(
-    not(all(feature = "syscall", feature = "kuser", feature = "reflex")),
-    allow(dead_code)
-)]
+#![allow(dead_code)]
 
 use core::ffi::c_void;
-#[cfg(feature = "hooks")]
 use core::sync::atomic::{AtomicI32, Ordering};
 
 // glibc no longer caches getpid(), so every access would otherwise cost a
 // second syscall. The cache is only sound while a fork child resets it, which
-// `hooks.rs` does from its `pthread_atfork` handler.
-#[cfg(feature = "hooks")]
+// `hooks.rs` does from its `pthread_atfork` handler. Artifact games fork with
+// a raw `SYS_fork`, which skips that handler, so the Artifact path asks the
+// kernel every time, as do unit tests (they fork raw).
 static PID: AtomicI32 = AtomicI32::new(0);
 
-#[cfg(feature = "hooks")]
 fn pid() -> libc::pid_t {
+    if cfg!(test) || crate::path::is_artifact() {
+        return unsafe { libc::getpid() };
+    }
     let cached = PID.load(Ordering::Relaxed);
     if cached != 0 {
         return cached;
@@ -28,12 +27,6 @@ fn pid() -> libc::pid_t {
     pid
 }
 
-#[cfg(not(feature = "hooks"))]
-fn pid() -> libc::pid_t {
-    unsafe { libc::getpid() }
-}
-
-#[cfg(feature = "hooks")]
 pub(crate) fn forget_pid_after_fork() {
     PID.store(0, Ordering::Relaxed);
 }
@@ -53,7 +46,7 @@ pub(crate) fn read_memory(address: u64, output: &mut [u8]) -> bool {
     unsafe { libc::process_vm_readv(pid(), &local, 1, &remote, 1, 0) == output.len() as isize }
 }
 
-pub(crate) fn write_memory(address: u64, bytes: &[u8]) -> bool {
+fn write_memory(address: u64, bytes: &[u8]) -> bool {
     let local = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: bytes.len(),

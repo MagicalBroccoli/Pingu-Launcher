@@ -154,5 +154,4 @@ pub(crate) fn init_registry() {
     }
 }
 
-#[cfg(feature = "reflex")]
 pub(crate) fn set_hwprofile_guid() {}

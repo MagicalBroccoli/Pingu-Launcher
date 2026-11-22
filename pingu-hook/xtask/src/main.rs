@@ -19,38 +19,25 @@ use tempfile::TempDir;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Dynamic symbols exported by `pingu-hook.so`: the libc `LD_PRELOAD`
+/// interposers only. Every other runtime function stays hidden via `local: *;`.
 const EXPORTS: &[&str] = &[
-    "cpuid_configure_profile",
-    "cpuid_activate_legacy_profile",
-    "cpuid_get_fixed_reply",
-    "cpuid_sigsegv_handler",
-    "detect_cpu_vendor",
     "sigaction",
     "free",
     "malloc",
     "read",
     "pread",
     "mmap",
-    "unsetenv",
-    "pingu_setup_hooks",
-    "forward_signal",
-    "reflex_handle_cpuid",
-    "reflex_route_syscall",
-    "syscallhook",
-    "kuser_apply_to_buffer",
-    "patch_kuser_shared_data_recipe",
-    "patch_kuser_shared_data",
-    "gettimeofday",
-    "set_offset",
-    "pingu_setup_faketime",
+    "mprotect",
     "setenv",
-    "debug_enabled",
-    "debug_runtime_activated",
-    "debug_log",
-    "debug_log_hex",
-    "debug_log_dec",
+    "unsetenv",
+    "gettimeofday",
 ];
+
+/// Constructors in the order they must run: the path selector first, then the
+/// shared modules, then the Reflex path's KUSER setup.
 const ANCHORS: &[&str] = &[
+    "pingu_setup_path",
     "pingu_setup_debug",
     "pingu_setup_gamescope",
     "pingu_setup_environment",
@@ -58,7 +45,6 @@ const ANCHORS: &[&str] = &[
     "pingu_setup_hooks",
     "pingu_setup_kuser",
 ];
-const INTERPOSITION_HOOKS: &[&str] = &["read", "pread", "mmap"];
 
 struct Context {
     root: PathBuf,
@@ -76,7 +62,7 @@ impl Context {
         cmd
     }
 
-    fn archive(&self, features: Option<&str>) -> Result<PathBuf> {
+    fn archive(&self) -> Result<PathBuf> {
         let mut cmd = self.cargo();
         cmd.args([
             "build",
@@ -85,13 +71,7 @@ impl Context {
             "pingu-hook-runtime",
             "--message-format=json-render-diagnostics",
         ]);
-        let target = if let Some(features) = features {
-            cmd.args(["--no-default-features", "--features", features]);
-            self.scratch.path().join("component-target")
-        } else {
-            self.target.clone()
-        };
-        cmd.arg("--target-dir").arg(&target);
+        cmd.arg("--target-dir").arg(&self.target);
         if !self.debug {
             cmd.arg("--release");
         }
@@ -149,7 +129,7 @@ impl Context {
     }
 
     fn build(&self, output: &Path) -> Result<()> {
-        let archive = self.archive(None)?;
+        let archive = self.archive()?;
         let map = self.export_map()?;
         let library = self.scratch.path().join("pingu-hook.so");
         let mut cmd = self.compiler();
@@ -162,8 +142,8 @@ impl Context {
         for anchor in ANCHORS {
             cmd.arg(format!("-Wl,-u,{anchor}"));
         }
-        for hook in INTERPOSITION_HOOKS {
-            cmd.arg(format!("-Wl,-u,{hook}"));
+        for name in EXPORTS {
+            cmd.arg(format!("-Wl,-u,{name}"));
         }
         cmd.arg(format!("-Wl,--version-script={}", map.display()))
             .arg(archive);

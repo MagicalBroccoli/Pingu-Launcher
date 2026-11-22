@@ -70,8 +70,11 @@ impl SignalSlot {
     }
 }
 
+const ARCH_SET_CPUID: c_int = 0x1012;
+
 static SIGSEGV_SLOT: SignalSlot = SignalSlot::new();
 static SIGSYS_SLOT: SignalSlot = SignalSlot::new();
+static SIGILL_SLOT: SignalSlot = SignalSlot::new();
 static SIGNAL_UPDATE_LOCK: AtomicBool = AtomicBool::new(false);
 static REAL_SIGACTION: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static REAL_FREE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -184,22 +187,23 @@ extern "C" fn after_fork() {
     SIGNAL_UPDATE_LOCK.store(false, Ordering::Release);
     SIGSEGV_SLOT.readers.store(0, Ordering::SeqCst);
     SIGSYS_SLOT.readers.store(0, Ordering::SeqCst);
+    SIGILL_SLOT.readers.store(0, Ordering::SeqCst);
+    crate::procmem::forget_pid_after_fork();
     set_tls_ptr(&RESOLVING_FREE_KEY, ptr::null_mut());
     set_tls_ptr(&RESOLVING_MALLOC_KEY, ptr::null_mut());
-    #[cfg(any(feature = "cpuid", feature = "syscall"))]
-    crate::procmem::forget_pid_after_fork();
     if WIN32U_FREE_GUARD_ENABLED.load(Ordering::Relaxed) {
         pending_frees::after_fork();
         WIN32U_SCANNED.store(false, Ordering::Release);
     }
-    unsafe { cpuid_disable_faulting() };
+    cpuid_disable_faulting();
+    if crate::path::is_artifact() {
+        crate::artifact::resolver::after_fork();
+        crate::artifact::cpuid::after_fork();
+        crate::artifact::after_fork();
+    }
 }
 
 unsafe extern "C" {
-    fn cpuid_sigsegv_handler(sig: c_int, info: *mut siginfo_t, context: *mut c_void);
-    fn cpuid_disable_faulting();
-    fn syscallhook(sig: c_int, info: *mut siginfo_t, context: *mut c_void);
-    fn detect_cpu_vendor();
     fn debug_runtime_activated();
     fn debug_log(message: *const c_char);
     fn debug_log_hex(prefix: *const c_char, value: u64);
@@ -214,12 +218,7 @@ fn set_errno(value: c_int) {
 }
 
 fn game_process() -> bool {
-    #[cfg(feature = "environment")]
-    {
-        crate::environment::game_process()
-    }
-    #[cfg(not(feature = "environment"))]
-    false
+    crate::environment::game_process()
 }
 
 fn resolve_real_free() -> Option<RealFree> {
@@ -360,20 +359,66 @@ fn resolve_real_sigaction() -> Option<RealSigaction> {
     Some(unsafe { core::mem::transmute::<*mut c_void, RealSigaction>(symbol) })
 }
 
+/// Re-enable CPUID faulting, which a fork child does not inherit.
+fn cpuid_disable_faulting() {
+    let _ = unsafe {
+        libc::syscall(
+            libc::SYS_arch_prctl,
+            ARCH_SET_CPUID as libc::c_long,
+            1 as libc::c_ulong,
+        )
+    };
+}
+
+unsafe fn detect_cpu_vendor() {
+    unsafe {
+        if crate::path::is_artifact() {
+            crate::artifact::cpuid::detect_cpu_vendor()
+        } else {
+            crate::reflex::cpuid::detect_cpu_vendor()
+        }
+    }
+}
+
+fn cpuid_handler() -> usize {
+    if crate::path::is_artifact() {
+        crate::artifact::cpuid::cpuid_sigsegv_handler as *const () as usize
+    } else {
+        crate::reflex::cpuid::cpuid_sigsegv_handler as *const () as usize
+    }
+}
+
+fn syscall_handler() -> usize {
+    if crate::path::is_artifact() {
+        crate::artifact::syscall::syscallhook as *const () as usize
+    } else {
+        crate::reflex::syscall::syscallhook as *const () as usize
+    }
+}
+
 fn slot_for(sig: c_int) -> Option<&'static SignalSlot> {
     match sig {
         libc::SIGSEGV => Some(&SIGSEGV_SLOT),
         libc::SIGSYS => Some(&SIGSYS_SLOT),
+        libc::SIGILL if crate::artifact::config::resolver_bridge_enabled() => Some(&SIGILL_SLOT),
         _ => None,
     }
 }
 
 fn bridge_handler(sig: c_int) -> usize {
     match sig {
-        libc::SIGSEGV => cpuid_sigsegv_handler as *const () as usize,
-        libc::SIGSYS => syscallhook as *const () as usize,
+        libc::SIGSEGV => cpuid_handler(),
+        libc::SIGSYS => syscall_handler(),
+        libc::SIGILL if crate::artifact::config::resolver_bridge_enabled() => {
+            crate::artifact::resolver::signal_bridge as *const () as usize
+        }
         _ => 0,
     }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn resolver_signal_ready() -> bool {
+    SIGILL_SLOT.owned.load(Ordering::Acquire)
 }
 
 unsafe fn action_is_bridge(sig: c_int, action: *const Sigaction) -> bool {
@@ -587,11 +632,13 @@ unsafe fn install_bridge(
         };
         unsafe { ptr::copy_nonoverlapping(source, oldact, 1) };
     }
-    #[cfg(feature = "kuser")]
-    crate::kuser::force_direct_syscall();
+    if crate::path::is_reflex() {
+        crate::reflex::kuser::force_direct_syscall();
+    }
     if sig == libc::SIGSEGV {
-        #[cfg(feature = "kuser")]
-        crate::kuser::prepare_shared_page();
+        if crate::path::is_reflex() {
+            crate::reflex::kuser::prepare_shared_page();
+        }
         if first_install {
             unsafe {
                 detect_cpu_vendor();
@@ -644,6 +691,23 @@ pub unsafe extern "C" fn sigaction(
         return unsafe { real(signum, act, oldact) };
     };
     if act.is_null() {
+        // Only the new resolver SIGILL channel changes query semantics here.
+        // Existing SIGSEGV/SIGSYS query behavior stays under its own contract.
+        if signum == libc::SIGILL {
+            let Some(_guard) = UpdateGuard::acquire() else {
+                return -1;
+            };
+            if slot.owned.load(Ordering::Acquire) {
+                let (saved, pointer) = slot.copy_saved_action();
+                if !pointer.is_null() {
+                    if !oldact.is_null() {
+                        // SAFETY: the reader-protected snapshot was copied by value.
+                        unsafe { ptr::copy_nonoverlapping(saved.as_ptr(), oldact, 1) };
+                    }
+                    return 0;
+                }
+            }
+        }
         return unsafe { real(signum, act, oldact) };
     }
     let Some(_guard) = UpdateGuard::acquire() else {
@@ -673,16 +737,129 @@ pub extern "C" fn pingu_setup_hooks() {
     {
         FORK_REGISTERED.store(false, Ordering::Release);
     }
-    #[cfg(all(
-        feature = "cpuid",
-        feature = "hooks",
-        feature = "reflex",
-        feature = "syscall",
-        feature = "kuser"
-    ))]
-    crate::artifact::start();
 }
 
 #[used]
 #[unsafe(link_section = ".init_array.00203")]
 static INITIALIZE: extern "C" fn() = pingu_setup_hooks;
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+
+    unsafe extern "C" fn saved_handler(_: c_int, _: *mut siginfo_t, context: *mut c_void) {
+        let frame = unsafe { &mut *context.cast::<libc::ucontext_t>() };
+        frame.uc_mcontext.gregs[libc::REG_RIP as usize] += 2;
+        set_errno(999);
+    }
+
+    #[test]
+    fn resolver_opt_out_leaves_sigill_unclaimed() {
+        if std::env::var_os("PINGU_OWNED_RESOLVER_OPT_OUT_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .env("PINGU_OWNED_RESOLVER_OPT_OUT_CHILD", "1")
+                .env("PINGU_HOOK_PATH", "artifact")
+                .env("PINGU_RESOLVER_BRIDGE", "0")
+                .args([
+                    "--exact",
+                    "hooks::resolver_tests::resolver_opt_out_leaves_sigill_unclaimed",
+                    "--test-threads=1",
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        assert!(!crate::artifact::config::resolver_bridge_enabled());
+        assert!(slot_for(libc::SIGILL).is_none());
+        assert_eq!(bridge_handler(libc::SIGILL), 0);
+    }
+
+    #[test]
+    fn resolver_unfamiliar_sigill_reaches_saved_handler_and_preserves_errno() {
+        // The subprocess rereads opt-in configuration before any handlers.
+        // Do not change process-wide signal state in the parent's test runner.
+        if std::env::var_os("PINGU_OWNED_RESOLVER_SIGNAL_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .env("PINGU_OWNED_RESOLVER_SIGNAL_CHILD", "1")
+                .env("PINGU_HOOK_PATH", "artifact").env("PINGU_RESOLVER_BRIDGE", "1")
+                .args(["--exact", "hooks::resolver_tests::resolver_unfamiliar_sigill_reaches_saved_handler_and_preserves_errno", "--test-threads=1"])
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        assert!(crate::artifact::config::resolver_bridge_enabled());
+        let mut saved = MaybeUninit::<Sigaction>::zeroed();
+        unsafe {
+            (*saved.as_mut_ptr()).sa_flags = libc::SA_SIGINFO;
+            (*saved.as_mut_ptr()).sa_sigaction = saved_handler as *const () as usize;
+        }
+        SIGILL_SLOT.current.store(&mut saved, Ordering::Release);
+        let mut info: siginfo_t = unsafe { core::mem::zeroed() };
+        info.si_code = 2;
+        let mut frame: libc::ucontext_t = unsafe { core::mem::zeroed() };
+        frame.uc_mcontext.gregs[libc::REG_RIP as usize] = 0x1000;
+        set_errno(123);
+        unsafe {
+            crate::artifact::resolver::signal_bridge(
+                libc::SIGILL,
+                &mut info,
+                (&mut frame as *mut libc::ucontext_t).cast(),
+            )
+        };
+        assert_eq!(errno(), 123);
+        assert_eq!(frame.uc_mcontext.gregs[libc::REG_RIP as usize], 0x1002);
+        SIGILL_SLOT
+            .current
+            .store(ptr::null_mut(), Ordering::Release);
+    }
+    #[test]
+    fn resolver_sigill_query_restore_preserves_logical_handler() {
+        const CHILD: &str = "PINGU_OWNED_RESOLVER_QUERY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .env(CHILD, "1").env("PINGU_HOOK_PATH", "artifact").env("PINGU_RESOLVER_BRIDGE", "1")
+                .args(["--exact", "hooks::resolver_tests::resolver_sigill_query_restore_preserves_logical_handler", "--test-threads=1"])
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        unsafe extern "C" fn temporary(_: c_int, _: *mut siginfo_t, _: *mut c_void) {}
+        let real = resolve_real_sigaction().unwrap();
+        let mut original: Sigaction = unsafe { core::mem::zeroed() };
+        original.sa_flags = libc::SA_SIGINFO;
+        original.sa_sigaction = saved_handler as *const () as usize;
+        assert_eq!(
+            unsafe { install_bridge(&SIGILL_SLOT, libc::SIGILL, &original, ptr::null_mut(), real) },
+            0
+        );
+        let mut queried: Sigaction = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe { sigaction(libc::SIGILL, ptr::null(), &mut queried) },
+            0
+        );
+        assert_eq!(queried.sa_sigaction, original.sa_sigaction);
+        let mut replacement = original;
+        replacement.sa_sigaction = temporary as *const () as usize;
+        assert_eq!(
+            unsafe { sigaction(libc::SIGILL, &replacement, ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            unsafe { sigaction(libc::SIGILL, &queried, ptr::null_mut()) },
+            0
+        );
+        let mut restored: Sigaction = unsafe { core::mem::zeroed() };
+        assert_eq!(
+            unsafe { sigaction(libc::SIGILL, ptr::null(), &mut restored) },
+            0
+        );
+        assert_eq!(restored.sa_sigaction, original.sa_sigaction);
+        let mut physical: Sigaction = unsafe { core::mem::zeroed() };
+        assert_eq!(unsafe { real(libc::SIGILL, ptr::null(), &mut physical) }, 0);
+        assert_eq!(
+            physical.sa_sigaction,
+            crate::artifact::resolver::signal_bridge as *const () as usize
+        );
+    }
+}

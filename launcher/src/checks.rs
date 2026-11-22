@@ -88,8 +88,8 @@ pub struct Plan {
     pub native_xcr0: Option<u64>,
     /// Whether the XCR0 restriction (module, runtime) is used.
     pub policy: bool,
-    /// pingu-hook's Artifact protocol (PINGU_ARTIFACT_PROTOCOL), which needs XCR0 to be 7 at run time.
-    pub artifact_protocol: bool,
+    /// pingu-hook's Artifact path (`PINGU_HOOK_PATH=artifact`), which needs XCR0 to be 7 at run time.
+    pub artifact_path: bool,
     policy_disabled: bool,
 }
 
@@ -103,7 +103,7 @@ impl Plan {
             mode: detection.mode,
             native_xcr0,
             policy,
-            artifact_protocol: artifact && (policy || native_xcr0 == Some(7)),
+            artifact_path: artifact && (policy || native_xcr0 == Some(7)),
             policy_disabled,
         }
     }
@@ -122,7 +122,7 @@ impl Plan {
                 "so pingu-policy is not needed"
             };
             let _ = write!(text, "\nNative XCR0 is {xcr0}, {verdict}.");
-            if self.artifact_protocol {
+            if self.artifact_path {
                 text.push_str("\npingu-hook's Artifact support active.");
             }
         }
