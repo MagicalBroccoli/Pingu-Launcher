@@ -336,13 +336,20 @@ mod tests {
     #[test]
     fn notify_takes_a_title_and_a_text() {
         assert_eq!(
-            tool(&["notify", "Artifact mode needed", "relaunch with --mode artifact"]),
+            tool(&[
+                "notify",
+                "Artifact mode needed",
+                "relaunch with --mode artifact"
+            ]),
             Tool::Notify {
                 title: "Artifact mode needed".into(),
                 text: "relaunch with --mode artifact".into(),
             }
         );
-        assert!(matches!(parse(words(&["notify", "only"])), Parsed::Error(_)));
+        assert!(matches!(
+            parse(words(&["notify", "only"])),
+            Parsed::Error(_)
+        ));
     }
 
     #[test]

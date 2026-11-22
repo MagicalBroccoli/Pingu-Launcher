@@ -759,7 +759,11 @@ mod tests {
         assert!(runner.contains(&format!("ORIGINAL = {:?}\n", original.to_str().unwrap())));
         assert!(!runner.contains("__ORIGINAL__"));
         assert_eq!(
-            fs::metadata(companion.join(RUNNER)).unwrap().permissions().mode() & 0o777,
+            fs::metadata(companion.join(RUNNER))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o755
         );
     }
@@ -1112,7 +1116,10 @@ mod tests {
         let rewritten = steam_command(&command, &companion, index);
         assert_eq!(rewritten[..index], command[..index]);
         assert_eq!(rewritten[index], companion.join("proton").to_string_lossy());
-        assert_eq!(rewritten[index + 1], companion.join(RUNNER).to_string_lossy());
+        assert_eq!(
+            rewritten[index + 1],
+            companion.join(RUNNER).to_string_lossy()
+        );
         assert_eq!(
             rewritten[index + 2],
             companion.join("original/proton").to_string_lossy()
