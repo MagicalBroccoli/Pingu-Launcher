@@ -432,6 +432,10 @@ fn fixed_reply(leaf: u32, rip: Option<u64>) -> Option<Registers> {
                     .as_ptr(),
                 );
             }
+            // The reflex path should never see artifact.dll: Artifact mode
+            // means the launcher armed the XCR0 restriction and selected the
+            // artifact path, so this launch was passed through unwrapped.
+            crate::alert::fire();
         }
     }
     let artifact_profile = ARTIFACT_PROFILE_SELECTED.load(Ordering::Acquire)

@@ -289,3 +289,45 @@ pub fn run(
         })
     }
 }
+
+/// Splits a message into blocks; indented lines form a command block.
+fn notice_blocks(body: &str) -> Vec<NoticeBlock> {
+    let mut blocks: Vec<(bool, Vec<&str>)> = Vec::new();
+    let mut fresh = true;
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            fresh = true;
+            continue;
+        }
+        let code = line.starts_with("    ");
+        match blocks.last_mut() {
+            Some((last, lines)) if !fresh && *last == code => lines.push(line.trim()),
+            _ => blocks.push((code, vec![line.trim()])),
+        }
+        fresh = false;
+    }
+    blocks
+        .into_iter()
+        .map(|(code, lines)| NoticeBlock {
+            text: lines.join(if code { "\n" } else { " " }).into(),
+            code,
+        })
+        .collect()
+}
+
+/// A standalone message box (the `notify` tool, spawned by pingu-hook when a
+/// game loads artifact.dll without Artifact mode). Returns once dismissed.
+pub fn notify(headline: &str, body: &str) -> Result<(), String> {
+    let ui = NotifyWindow::new().map_err(|error| error.to_string())?;
+    ui.set_headline(headline.into());
+    ui.set_blocks(ModelRc::new(VecModel::from(notice_blocks(body))));
+    ui.on_ok({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                let _ = ui.hide();
+            }
+        }
+    });
+    ui.run().map_err(|error| error.to_string())
+}

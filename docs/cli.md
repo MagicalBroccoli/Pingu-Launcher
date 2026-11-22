@@ -213,6 +213,12 @@ reset or migrate your existing prefix.
 | `PINGU_HOOK_VARIANT` | Use `variants/pingu-hook.<name>.so` of the data directory instead of the built-in library |
 
 The launcher sets `PINGU_HOOK_PATH=artifact` in Artifact mode when XCR0 is or will be 7.
+It also sets `PINGU_LAUNCHER` to its own path: when a game loads `artifact.dll`
+without Artifact mode (the scan missed it, so the launch was passed through
+unwrapped), `pingu-hook` writes a stderr line and asks that binary to show a
+`notify TITLE TEXT` message box. Under gamescope the box may not present; the
+stderr line is the authoritative message.
+
 `pingu-hook` reads these variables itself (they work without the launcher):
 
 | Variable | Effect |

@@ -40,6 +40,7 @@ mod maps;
 mod page_guard;
 mod procmem;
 
+pub(crate) mod alert;
 pub mod artifact;
 pub mod debug;
 pub mod environment;

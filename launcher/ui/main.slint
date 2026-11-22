@@ -17,6 +17,12 @@ export struct CheckItem {
     action-id: string,
 }
 
+export struct NoticeBlock {
+    text: string,
+    // Shown as a selectable command rather than prose.
+    code: bool,
+}
+
 global Palette {
     out property <color> window: #12151a;
     out property <color> card: #1b1f26;
@@ -420,6 +426,116 @@ export component MainWindow inherits Window {
                 primary: true;
                 enabled: root.all-ok && !root.busy;
                 clicked => { root.launch(); }
+            }
+        }
+    }
+}
+
+// The standalone message box of the `notify` tool, spawned by pingu-hook.
+export component NotifyWindow inherits Window {
+    title: "Pingu";
+    preferred-width: 520px;
+    min-width: 520px;
+    max-width: 520px;
+    // Fixed size, so tiling window managers leave it floating at its natural height.
+    min-height: content.preferred-height;
+    max-height: content.preferred-height;
+    background: Palette.window;
+
+    in property <string> headline;
+    in property <[NoticeBlock]> blocks;
+    callback ok();
+
+    // A sibling rather than a parent: a FocusScope around the layout would hide its preferred size from the window.
+    FocusScope {
+        width: 0px;
+        height: 0px;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Escape) {
+                root.ok();
+                return accept;
+            }
+            reject
+        }
+    }
+
+    content := VerticalLayout {
+        alignment: start;
+
+        Rectangle {
+            height: 4px;
+            background: Palette.problem;
+        }
+
+        VerticalLayout {
+            padding: 24px;
+            padding-top: 22px;
+            spacing: 18px;
+            alignment: start;
+
+            HorizontalLayout {
+                spacing: 16px;
+
+                Rectangle {
+                    width: 44px;
+                    height: 44px;
+                    border-radius: 22px;
+                    background: Palette.problem;
+
+                    Text {
+                        text: "!";
+                        font-size: 24px;
+                        font-weight: 700;
+                        color: #0b0d10;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 4px;
+
+                    Text {
+                        text: root.headline;
+                        font-size: 20px;
+                        font-weight: 700;
+                        color: Palette.text;
+                        wrap: word-wrap;
+                    }
+
+                    Text {
+                        text: "Pingu runtime";
+                        font-size: 12px;
+                        color: #6e7a8a;
+                    }
+                }
+            }
+
+            for block in root.blocks: VerticalLayout {
+                alignment: start;
+
+                if !block.code: Text {
+                    text: block.text;
+                    wrap: word-wrap;
+                    font-size: 14px;
+                    color: Palette.muted;
+                }
+
+                if block.code: CodeBlock {
+                    text: block.text;
+                }
+            }
+
+            HorizontalLayout {
+                alignment: end;
+
+                Button {
+                    text: "OK";
+                    primary: true;
+                    clicked => { root.ok(); }
+                }
             }
         }
     }

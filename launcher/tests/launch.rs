@@ -87,7 +87,11 @@ fn legacy_mode_runs_the_command_directly_under_the_preload() {
     assert_eq!(launch.program, "umu-run");
     assert_eq!(launch.args, ["game.exe"]);
     assert_eq!(env(&launch, "LD_PRELOAD"), Some(library(&fixture).as_str()));
-    assert_eq!(launch.env.len(), 1);
+    assert_eq!(
+        env(&launch, "PINGU_LAUNCHER"),
+        Some(fixture.sys.exe.to_str().unwrap())
+    );
+    assert_eq!(launch.env.len(), 2);
     // The library was installed into the data directory.
     assert!(fixture.home.hook().is_file());
 }

@@ -60,6 +60,11 @@ pub fn build(
     let preload =
         hook::compose_preload(sys.env("LD_PRELOAD"), &library.path, base_name(&command[0]));
     let mut env = vec![("LD_PRELOAD".to_string(), preload)];
+    // Where pingu-hook sends its Artifact-mode message box.
+    env.push((
+        "PINGU_LAUNCHER".into(),
+        sys.exe.to_string_lossy().into_owned(),
+    ));
     if report.plan.artifact_path && sys.env("PINGU_HOOK_PATH").is_none() {
         env.push(("PINGU_HOOK_PATH".into(), "artifact".into()));
     }

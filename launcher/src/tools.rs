@@ -121,6 +121,7 @@ pub fn run(sys: &Sys, home: &Home, tool: Tool) -> Result<(), String> {
             println!("{}", companion.display());
             Ok(())
         }
+        Tool::Notify { title, text } => crate::ui::notify(&title, &text),
         Tool::Selftest => selftest(sys, home),
     }
 }

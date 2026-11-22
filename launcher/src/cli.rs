@@ -49,6 +49,8 @@ Tools:
   module uninstall     Remove the installed modules and their loading at boot (needs root)
   selftest             Run the native module test (needs the loaded module)
   prepare PROTON_DIR   Print the companion Proton the wrapper would use
+  notify TITLE TEXT    Show a message box (pingu-hook spawns this when a game
+                       loads artifact.dll without Artifact mode)
 
 Use it as a command prefix, for example in Lutris:
   pingu-launcher
@@ -96,6 +98,10 @@ pub enum Tool {
     Selftest,
     Prepare {
         proton: PathBuf,
+    },
+    Notify {
+        title: String,
+        text: String,
     },
 }
 
@@ -199,6 +205,10 @@ fn parse_tool(name: &str, args: Vec<String>) -> Result<Tool, String> {
         ("prepare", _) => Ok(Tool::Prepare {
             proton: one("prepare", positional)?,
         }),
+        ("notify", _) => match <[String; 2]>::try_from(positional) {
+            Ok([title, text]) => Ok(Tool::Notify { title, text }),
+            Err(_) => Err("notify needs exactly two arguments: TITLE TEXT".into()),
+        },
         ("runtime", other) => Err(format!("unknown runtime tool {other}")),
         ("module", other) => Err(format!("unknown module tool {other}")),
         (other, _) => Err(format!("unknown tool {other}")),
@@ -245,7 +255,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Parsed {
             other if other.starts_with('-') && other.len() > 1 => {
                 return Parsed::Error(format!("unknown option {other}"));
             }
-            "runtime" | "module" | "selftest" | "prepare" => {
+            "runtime" | "module" | "selftest" | "prepare" | "notify" => {
                 return match parse_tool(&arg, args.collect()) {
                     Ok(tool) => Parsed::Tool {
                         data_dir: options.data_dir,
@@ -321,6 +331,18 @@ mod tests {
             parse(words(&["--project-dir", "x"])),
             Parsed::Error(_)
         ));
+    }
+
+    #[test]
+    fn notify_takes_a_title_and_a_text() {
+        assert_eq!(
+            tool(&["notify", "Artifact mode needed", "relaunch with --mode artifact"]),
+            Tool::Notify {
+                title: "Artifact mode needed".into(),
+                text: "relaunch with --mode artifact".into(),
+            }
+        );
+        assert!(matches!(parse(words(&["notify", "only"])), Parsed::Error(_)));
     }
 
     #[test]
